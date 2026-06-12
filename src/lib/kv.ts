@@ -1,11 +1,12 @@
-import { kv as vercelKv } from "@vercel/kv";
+import Redis from "ioredis";
+
+// ─── In-memory fallback (local dev without Redis) ────────────────────────────
 
 type MemoryEntry = {
   value: unknown;
   expiresAt?: number;
 };
 
-// Persist across Next.js hot reloads in local dev.
 const globalForMemory = globalThis as typeof globalThis & {
   __boomerDropKv?: Map<string, MemoryEntry>;
   __boomerDropKvTimers?: Map<string, ReturnType<typeof setTimeout>>;
@@ -20,9 +21,31 @@ const expiryTimers =
   new Map<string, ReturnType<typeof setTimeout>>();
 globalForMemory.__boomerDropKvTimers = expiryTimers;
 
-function isMemoryMode(): boolean {
-  return !process.env.KV_REST_API_URL;
+// ─── Redis client (production) ───────────────────────────────────────────────
+
+// Reuse the connection across hot reloads / multiple invocations in the same
+// process so we don't exhaust the Redis connection limit.
+const globalForRedis = globalThis as typeof globalThis & {
+  __boomerDropRedis?: Redis;
+};
+
+function getRedis(): Redis {
+  if (!globalForRedis.__boomerDropRedis) {
+    globalForRedis.__boomerDropRedis = new Redis(
+      process.env.REDIS_URL as string,
+      { maxRetriesPerRequest: 3, lazyConnect: false }
+    );
+  }
+  return globalForRedis.__boomerDropRedis;
 }
+
+// ─── Mode detection ──────────────────────────────────────────────────────────
+
+function isMemoryMode(): boolean {
+  return !process.env.REDIS_URL;
+}
+
+// ─── Memory helpers ──────────────────────────────────────────────────────────
 
 function purgeExpired(key: string): void {
   const entry = memoryStore.get(key);
@@ -56,6 +79,8 @@ function getMemoryList(key: string): string[] {
   return Array.isArray(entry.value) ? (entry.value as string[]) : [];
 }
 
+// ─── Public API ──────────────────────────────────────────────────────────────
+
 export async function rpush(key: string, value: string): Promise<number> {
   if (isMemoryMode()) {
     const list = getMemoryList(key);
@@ -66,7 +91,7 @@ export async function rpush(key: string, value: string): Promise<number> {
     });
     return list.length;
   }
-  return vercelKv.rpush(key, value);
+  return getRedis().rpush(key, value);
 }
 
 export async function lrange(
@@ -79,7 +104,7 @@ export async function lrange(
     const normalizedEnd = end < 0 ? list.length + end + 1 : end + 1;
     return list.slice(start, normalizedEnd);
   }
-  return vercelKv.lrange(key, start, end);
+  return getRedis().lrange(key, start, end);
 }
 
 export async function expire(key: string, seconds: number): Promise<number> {
@@ -91,7 +116,7 @@ export async function expire(key: string, seconds: number): Promise<number> {
     scheduleExpiry(key, seconds);
     return 1;
   }
-  return vercelKv.expire(key, seconds);
+  return getRedis().expire(key, seconds);
 }
 
 export async function set(
@@ -106,10 +131,10 @@ export async function set(
     return;
   }
   if (options?.ex) {
-    await vercelKv.set(key, value, { ex: options.ex });
+    await getRedis().set(key, value, "EX", options.ex);
     return;
   }
-  await vercelKv.set(key, value);
+  await getRedis().set(key, value);
 }
 
 export async function get(key: string): Promise<string | null> {
@@ -119,6 +144,5 @@ export async function get(key: string): Promise<string | null> {
     if (!entry) return null;
     return typeof entry.value === "string" ? entry.value : null;
   }
-  const value = await vercelKv.get<string>(key);
-  return value ?? null;
+  return getRedis().get(key);
 }
