@@ -84,8 +84,8 @@ const PARTITION_ACK_TIMEOUT_MS = 90_000;
 const SEND_HEARTBEAT_MS = 10_000;
 const RECV_NOTIFY_INTERVAL_MS = 250;
 const IN_MEMORY_SEND_MAX = 256 * 1024 * 1024;
-const MAX_SEND_BUFFER = 4 * 1024 * 1024;
-const SEND_BUFFER_LOW = 1024 * 1024;
+const MAX_SEND_BUFFER = 16 * 1024 * 1024;
+const SEND_BUFFER_LOW = 4 * 1024 * 1024;
 
 export function createTransferSession(options: TransferSessionOptions) {
   let pc: RTCPeerConnection | null = null;
@@ -299,6 +299,29 @@ export function createTransferSession(options: TransferSessionOptions) {
     fileChunker?.nextPartition();
   }
 
+  function sendChunkSync(
+    file: File,
+    data: ArrayBuffer | ArrayBufferView
+  ): void {
+    if (!dc || dc.readyState !== "open") {
+      throw new Error("Data channel is not open");
+    }
+
+    const byteLength =
+      data instanceof ArrayBuffer ? data.byteLength : data.byteLength;
+
+    if (data instanceof ArrayBuffer) {
+      dc.send(data);
+    } else {
+      dc.send(data as ArrayBufferView<ArrayBuffer>);
+    }
+
+    sendBytesQueued += byteLength;
+    lastAckedOffset = sendBytesQueued;
+    lastSendActivityAt = Date.now();
+    scheduleProgress(file.name, sendBytesQueued, file.size);
+  }
+
   async function sendBufferPartitions(
     file: File,
     view: Uint8Array,
@@ -311,8 +334,13 @@ export function createTransferSession(options: TransferSessionOptions) {
       let chunkStart = offset;
 
       while (chunkStart < partitionEnd) {
+        if (!dc || dc.readyState !== "open") {
+          throw new Error("Data channel is not open");
+        }
+        await waitForSendBufferDrain(dc);
+
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, partitionEnd);
-        await sendBytes(file, view.subarray(chunkStart, chunkEnd));
+        sendChunkSync(file, view.subarray(chunkStart, chunkEnd));
         lastLoggedSendPct = logTransferProgress(
           "send",
           sendBytesQueued,
@@ -988,7 +1016,7 @@ export function createTransferSession(options: TransferSessionOptions) {
       const mbSize = (file.size / (1024 * 1024)).toFixed(1);
       const useBuffer = file.size <= IN_MEMORY_SEND_MAX;
       debug(
-        `send start: ${file.name} (${mbSize} MB, ${CHUNK_SIZE / 1024} KB chunks / 1 MB partitions, ${useBuffer ? "buffered" : "streamed"})${startOffset ? ` from offset ${startOffset}` : ""}`
+        `send start: ${file.name} (${mbSize} MB, ${CHUNK_SIZE / 1024} KB chunks / ${MAX_PARTITION_SIZE / (1024 * 1024)} MB partitions, ${useBuffer ? "buffered" : "streamed"})${startOffset ? ` from offset ${startOffset}` : ""}`
       );
       scheduleProgress(file.name, startOffset, file.size);
 
