@@ -1,5 +1,4 @@
 import type { SignalMessage } from "@/lib/signaling";
-import { FileChunker } from "./file-chunker";
 import {
   createSignalingTransport,
   type SignalingTransport,
@@ -55,29 +54,16 @@ interface FileDoneMessage {
   type: "done";
 }
 
-interface PartitionMessage {
-  type: "partition";
-  offset: number;
-}
+type ControlMessage = FileMetaMessage | FileDoneMessage;
 
-interface PartitionReceivedMessage {
-  type: "partition-received";
-  offset: number;
-}
-
-type ControlMessage =
-  | FileMetaMessage
-  | FileDoneMessage
-  | PartitionMessage
-  | PartitionReceivedMessage;
-
+const CHUNK_SIZE = 64 * 1024;
 const GUEST_READY_RETRY_MS = 1500;
 const ICE_GATHER_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 800;
-const PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024;
+const PROGRESS_UPDATE_INTERVAL = 256 * 1024;
+const DEBUG_LOG_INTERVAL = 256 * 1024;
 const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
 const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024;
-const PARTITION_ACK_TIMEOUT_MS = 60_000;
 const SEND_BUFFER_TIMEOUT_MS = 20_000;
 
 function waitForIceGathering(
@@ -126,16 +112,14 @@ export function createTransferSession(options: TransferSessionOptions) {
   let receiveMeta: FileMetaMessage | null = null;
   let receiveBytes = 0;
   let lastProgressBytes = 0;
+  let lastDebugRecvBytes = 0;
   let lanHost: string | null = null;
   let iceServers: RTCIceServer[] = [];
 
   // Send state
   let sendQueue: File[] = [];
   let currentSendFile: File | null = null;
-  let chunker: FileChunker | null = null;
   let lastAckedOffset = 0;
-  let partitionAckWaiter: ((offset: number) => void) | null = null;
-  let pendingPartitionAckOffset: number | null = null;
 
   function debug(message: string): void {
     options.onDebug?.(message);
@@ -153,37 +137,6 @@ export function createTransferSession(options: TransferSessionOptions) {
   async function sendSignal(message: SignalMessage): Promise<boolean> {
     if (!signaling) return false;
     return signaling.send(message);
-  }
-
-  function waitForPartitionAck(expectedOffset: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(
-          new Error(
-            `Timed out waiting for receiver ack at ${expectedOffset} bytes`
-          )
-        );
-      }, PARTITION_ACK_TIMEOUT_MS);
-
-      partitionAckWaiter = (offset) => {
-        if (offset !== expectedOffset) return;
-        cleanup();
-        resolve();
-      };
-
-      const channel = dc;
-      const onClose = () => {
-        cleanup();
-        reject(new Error("Data channel closed while waiting for partition ack"));
-      };
-      const cleanup = () => {
-        clearTimeout(timer);
-        partitionAckWaiter = null;
-        channel?.removeEventListener("close", onClose);
-      };
-      channel?.addEventListener("close", onClose);
-    });
   }
 
   function waitForSendBuffer(channel: RTCDataChannel): Promise<void> {
@@ -262,31 +215,15 @@ export function createTransferSession(options: TransferSessionOptions) {
       throw new Error("Data channel is not open");
     }
     await waitForSendBuffer(dc);
-    dc.send(chunk);
+    try {
+      dc.send(chunk);
+    } catch (error) {
+      throw new Error(
+        `Failed to send chunk: ${error instanceof Error ? error.message : String(error)}`
+      );
+    }
     sendBytesQueued += chunk.byteLength;
     reportSendProgress(file, sendBytesQueued);
-  }
-
-  function trySendPartitionAck(offset: number): void {
-    if (!receiveMeta) return;
-    if (receiveBytes < offset) {
-      pendingPartitionAckOffset = offset;
-      return;
-    }
-    pendingPartitionAckOffset = null;
-    sendSignalOnChannel({
-      type: "partition-received",
-      offset,
-    });
-  }
-
-  function maybeFlushPendingPartitionAck(): void {
-    if (
-      pendingPartitionAckOffset !== null &&
-      receiveBytes >= pendingPartitionAckOffset
-    ) {
-      trySendPartitionAck(pendingPartitionAckOffset);
-    }
   }
 
   async function flushPendingIce(): Promise<void> {
@@ -360,9 +297,9 @@ export function createTransferSession(options: TransferSessionOptions) {
       } else if (state === "connecting") {
         options.onStatus("connecting");
       } else if (state === "disconnected") {
-        if (!destroyed && wasConnected) {
+        debug("connection temporarily disconnected");
+        if (!destroyed && transferActive) {
           options.onStatus("reconnecting");
-          scheduleReconnect();
         }
       } else if (state === "failed") {
         if (!destroyed && options.role === "host" && (transferActive || wasConnected)) {
@@ -437,16 +374,27 @@ export function createTransferSession(options: TransferSessionOptions) {
         const chunk = event.data as ArrayBuffer;
         receiveBuffer.push(chunk);
         receiveBytes += chunk.byteLength;
-        maybeFlushPendingPartitionAck();
 
         const isDone = receiveBytes >= receiveMeta.size;
-        if (isDone || receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL) {
+        if (
+          isDone ||
+          receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL
+        ) {
           lastProgressBytes = receiveBytes;
           options.onProgress({
             fileName: receiveMeta.name,
             sent: receiveBytes,
             total: receiveMeta.size,
           });
+        }
+        if (
+          isDone ||
+          receiveBytes - lastDebugRecvBytes >= DEBUG_LOG_INTERVAL
+        ) {
+          debug(
+            `recv ${Math.round((receiveBytes / receiveMeta.size) * 100)}% (${(receiveBytes / (1024 * 1024)).toFixed(1)} MB)`
+          );
+          lastDebugRecvBytes = receiveBytes;
         }
       } catch {
         abortReceive(
@@ -467,16 +415,6 @@ export function createTransferSession(options: TransferSessionOptions) {
         );
         break;
 
-      case "partition":
-        trySendPartitionAck(parsed.offset);
-        break;
-
-      case "partition-received":
-        partitionAckWaiter?.(parsed.offset);
-        partitionAckWaiter = null;
-        lastAckedOffset = parsed.offset;
-        break;
-
       case "done":
         debug(
           `recv done: ${receiveMeta?.name ?? "?"} — got ${receiveBytes} / ${receiveMeta?.size ?? "?"} bytes`
@@ -484,11 +422,6 @@ export function createTransferSession(options: TransferSessionOptions) {
         finalizeReceivedFile();
         break;
     }
-  }
-
-  function sendSignalOnChannel(message: ControlMessage): void {
-    if (!dc || dc.readyState !== "open") return;
-    dc.send(JSON.stringify(message));
   }
 
   async function handleSignal(message: SignalMessage): Promise<void> {
@@ -665,7 +598,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     receiveMeta = null;
     receiveBytes = 0;
     lastProgressBytes = 0;
-    pendingPartitionAckOffset = null;
+    lastDebugRecvBytes = 0;
   }
 
   function abortReceive(reason: string): void {
@@ -735,78 +668,37 @@ export function createTransferSession(options: TransferSessionOptions) {
       dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
       options.onFileSent?.({ name: file.name, size: file.size });
       currentSendFile = null;
-      chunker = null;
       setTransferActive(false);
       return;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = () => {
-        if (settled) return;
-        settled = true;
-        resolve();
-      };
-      const fail = (error: Error) => {
-        if (settled) return;
-        settled = true;
-        reject(error);
-      };
+    let offset = startOffset;
+    let lastDebugSent = startOffset;
 
-      const startPartition = (offset: number) => {
-        chunker = new FileChunker(
-          file,
-          offset,
-          async (chunk) => {
-            await sendBinaryChunk(file, chunk);
-          },
-          (partitionOffset) => {
-            if (!dc || dc.readyState !== "open") {
-              fail(new Error("Data channel closed during send"));
-              return;
-            }
+    while (offset < file.size) {
+      if (!dc || dc.readyState !== "open") {
+        throw new Error("Data channel closed during send");
+      }
 
-            dc.send(
-              JSON.stringify({
-                type: "partition",
-                offset: partitionOffset,
-              } satisfies PartitionMessage)
-            );
+      const end = Math.min(offset + CHUNK_SIZE, file.size);
+      const buffer = await file.slice(offset, end).arrayBuffer();
+      await sendBinaryChunk(file, buffer);
+      offset = end;
+      lastAckedOffset = offset;
 
-            void waitForPartitionAck(partitionOffset)
-              .then(() => {
-                lastAckedOffset = partitionOffset;
-                options.onProgress({
-                  fileName: file.name,
-                  sent: partitionOffset,
-                  total: file.size,
-                });
-                if (chunker && !chunker.isFileEnd()) {
-                  startPartition(partitionOffset);
-                }
-              })
-              .catch(fail);
-          },
-          () => {
-            if (!dc || dc.readyState !== "open") {
-              fail(new Error("Data channel closed during send"));
-              return;
-            }
-            dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
-            debug(`send done: ${file.name}`);
-            options.onFileSent?.({ name: file.name, size: file.size });
-            currentSendFile = null;
-            chunker = null;
-            setTransferActive(false);
-            finish();
-          },
-          (error) => fail(error)
+      if (offset - lastDebugSent >= DEBUG_LOG_INTERVAL || offset >= file.size) {
+        debug(
+          `send ${Math.round((offset / file.size) * 100)}% (${(offset / (1024 * 1024)).toFixed(1)} MB)`
         );
-        chunker.nextPartition();
-      };
+        lastDebugSent = offset;
+      }
+    }
 
-      startPartition(startOffset);
-    });
+    dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
+    debug(`send done: ${file.name}`);
+    options.onFileSent?.({ name: file.name, size: file.size });
+    currentSendFile = null;
+    setTransferActive(false);
   }
 
   async function sendFile(file: File, startOffset = 0): Promise<void> {
