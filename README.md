@@ -9,10 +9,12 @@ npm install
 npm run dev
 ```
 
-Add your computer's LAN IP to `.env.local` so the QR code points to an address the other device can reach:
+Add to `.env.local`:
 
 ```
 BOOMER_DROP_PUBLIC_HOST=10.0.0.23
+NEXT_PUBLIC_SUPABASE_URL=https://your-project.supabase.co
+NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=sb_publishable_...
 ```
 
 **On your computer:** open `http://localhost:3000`
@@ -31,39 +33,47 @@ Open `https://localhost:3000` on your computer (accept the certificate warning).
 
 ## Environment variables
 
-Copy `.env.example` to `.env.local` and fill in:
-
 | Variable | Required | Description |
 |---|---|---|
 | `BOOMER_DROP_PUBLIC_HOST` | Local dev | Your computer's LAN IP for QR codes |
-| `KV_REST_API_URL` | Production | Vercel KV REST API URL (auto-set when linked) |
-| `KV_REST_API_TOKEN` | Production | Vercel KV REST API token |
+| `NEXT_PUBLIC_SUPABASE_URL` | Yes | Supabase project URL (Realtime signaling) |
+| `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` | Yes* | Supabase publishable key (`sb_publishable_…`) |
+| `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Yes* | Legacy anon JWT (alternative to publishable key) |
+| `REDIS_URL` | Production | Redis for room metadata |
 | `CLOUDFLARE_TURN_KEY_ID` | Optional | Cloudflare TURN key ID |
 | `CLOUDFLARE_TURN_API_TOKEN` | Optional | Cloudflare TURN API token |
 
-**Local dev without KV:** if the KV variables are absent, signaling falls back to in-memory storage. This only works with a single server process.
+### Supabase Realtime setup
 
-**Without TURN:** Google STUN is used as a fallback. Transfers across different networks (e.g. cellular ↔ Wi-Fi) may fail to connect without TURN.
+1. Create a free project at [supabase.com](https://supabase.com)
+2. Copy the project URL and anon key into `.env.local` / Vercel env vars
+3. Realtime is enabled by default — no database tables needed for signaling
+
+Free tier includes **200 concurrent WebSocket connections** (~100 simultaneous transfer pairs).
+
+**Local dev without Redis:** room creation falls back to in-memory storage (single process only).
+
+**Without TURN:** Google STUN is used as a fallback. Cross-network transfers may need Cloudflare TURN.
 
 ## Deploy to Vercel
 
 1. Push to GitHub and import the project in [Vercel](https://vercel.com).
-2. Link a **KV** store from the Vercel dashboard (Storage → KV).
-3. Optionally add Cloudflare TURN credentials under Project Settings → Environment Variables.
-4. Deploy.
+2. Add Redis (`REDIS_URL`), Supabase URL + anon key, and optional TURN credentials.
+3. Deploy.
 
 ## How it works
 
 - **QR pairing** — Host creates a room; the other device scans the QR to open `/join/[roomId]`.
-- **Verification code** — Both devices derive the same 4-character code from the room ID. Confirm they match before sending.
-- **WebRTC data channel** — Files transfer peer-to-peer over an encrypted DTLS channel. Nothing passes through the server.
-- **Signaling** — Ephemeral WebRTC offer/answer/ICE messages are exchanged via Vercel KV (600 s TTL).
-- **TURN** — Cloudflare TURN helps with connections through restrictive networks (firewalls, double-NAT, cellular).
-- **Backpressure** — The sender pauses when the data channel buffer fills up, preventing data loss on large files.
+- **Verification code** — Both devices derive the same 4-character code from the room ID.
+- **WebRTC data channel** — Files transfer peer-to-peer over an encrypted DTLS channel.
+- **Supabase Realtime** — WebRTC offer/answer/ICE pushed instantly over WebSockets (no HTTP polling).
+- **Partition acks** — 1 MB partitions with receiver acks for Safari-friendly throughput and resume on reconnect.
+- **Wake lock** — Screen stays awake during transfers so iOS doesn't suspend the tab.
+- **Auto-download** — Optional; notifies you when files arrive while the tab is in the background.
+- **PWA** — Add to Home Screen for a standalone app experience.
 
 ## Stack
 
 - Next.js (App Router) · React · TypeScript · Tailwind CSS v4
-- `@vercel/kv` for signaling storage
-- `qrcode` for QR generation
-- WebRTC `RTCPeerConnection` + `RTCDataChannel` (no third-party WebRTC library)
+- Supabase Realtime (signaling) · Redis (room metadata)
+- WebRTC `RTCPeerConnection` + `RTCDataChannel`

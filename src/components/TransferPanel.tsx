@@ -7,12 +7,21 @@ import {
   type ReceivedFile,
   type TransferProgress,
 } from "@/lib/webrtc/transfer";
+import {
+  notifyFileReceived,
+  notificationsSupported,
+  requestNotificationPermission,
+} from "@/lib/notifications";
+import {
+  getAutoDownloadEnabled,
+  setAutoDownloadEnabled,
+} from "@/lib/transfer-preferences";
+import { acquireWakeLock, releaseWakeLock } from "@/lib/wake-lock";
 import { ConnectionStatus } from "./ConnectionStatus";
 import { FilePicker } from "./FilePicker";
 import { QRDisplay } from "./QRDisplay";
 import { VerificationBadge } from "./VerificationBadge";
 
-// Set to true to show the transfer log panel for debugging.
 const SHOW_TRANSFER_LOG = false;
 
 function formatFileSize(bytes: number): string {
@@ -30,7 +39,6 @@ function triggerDownload(blob: Blob, name: string): void {
   document.body.appendChild(anchor);
   anchor.click();
   document.body.removeChild(anchor);
-  // Delay revocation so mobile Safari has time to initiate the download.
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
 
@@ -46,7 +54,10 @@ function hintText(
   role: "host" | "guest"
 ): string | null {
   if (status === "failed") {
-    return "Make sure both devices are on the same network, then refresh and scan again.";
+    return "Could not connect. Check your network, refresh, and scan the QR code again.";
+  }
+  if (status === "reconnecting") {
+    return "Connection dropped — reconnecting…";
   }
   if (status === "connected") return null;
   if (role === "host") {
@@ -64,12 +75,14 @@ export function TransferPanel({
   const [status, setStatus] = useState<ConnectionState>("idle");
   const [sessionKey, setSessionKey] = useState(0);
   const [sending, setSending] = useState(false);
+  const [transferActive, setTransferActive] = useState(false);
   const [progress, setProgress] = useState<TransferProgress | null>(null);
   const [received, setReceived] = useState<ReceivedFile[]>([]);
   const [sent, setSent] = useState<{ name: string; size: number }[]>([]);
   const [receiveError, setReceiveError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
   const [debugLog, setDebugLog] = useState<string[]>([]);
+  const [autoDownload, setAutoDownload] = useState(() => getAutoDownloadEnabled());
   const sessionRef = useRef<ReturnType<typeof createTransferSession> | null>(
     null
   );
@@ -78,6 +91,20 @@ export function TransferPanel({
     const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
     setDebugLog((prev) => [...prev.slice(-19), `${ts}  ${message}`]);
   }, []);
+
+  const handleFileReceived = useCallback(
+    (file: ReceivedFile) => {
+      setReceived((prev) => [...prev, file]);
+      setProgress(null);
+      setReceiveError(null);
+
+      if (autoDownload) {
+        triggerDownload(file.blob, file.name);
+      }
+      notifyFileReceived(file.name);
+    },
+    [autoDownload]
+  );
 
   useEffect(() => {
     let active = true;
@@ -93,9 +120,7 @@ export function TransferPanel({
       },
       onFileReceived: (file) => {
         if (!active) return;
-        setReceived((prev) => [...prev, file]);
-        setProgress(null);
-        setReceiveError(null);
+        handleFileReceived(file);
       },
       onReceiveError: (message) => {
         if (!active) return;
@@ -105,6 +130,9 @@ export function TransferPanel({
       onFileSent: (file) => {
         if (!active) return;
         setSent((prev) => [...prev, file]);
+      },
+      onTransferActive: (activeTransfer) => {
+        if (active) setTransferActive(activeTransfer);
       },
       onDebug: (message) => {
         if (active) addDebug(message);
@@ -119,7 +147,28 @@ export function TransferPanel({
       session.destroy();
       sessionRef.current = null;
     };
-  }, [roomId, role, sessionKey, addDebug]);
+  }, [roomId, role, sessionKey, addDebug, handleFileReceived]);
+
+  useEffect(() => {
+    if (sending || transferActive || progress) {
+      void acquireWakeLock();
+      return () => {
+        void releaseWakeLock();
+      };
+    }
+    void releaseWakeLock();
+  }, [sending, transferActive, progress]);
+
+  useEffect(() => {
+    const onBeforeUnload = (event: BeforeUnloadEvent) => {
+      if (sending || transferActive) {
+        event.preventDefault();
+        event.returnValue = "";
+      }
+    };
+    window.addEventListener("beforeunload", onBeforeUnload);
+    return () => window.removeEventListener("beforeunload", onBeforeUnload);
+  }, [sending, transferActive]);
 
   const handleSend = useCallback(async (files: File[]) => {
     if (!sessionRef.current) return;
@@ -148,13 +197,21 @@ export function TransferPanel({
     setSessionKey((key) => key + 1);
   }, []);
 
-  const connected = status === "connected";
+  const toggleAutoDownload = useCallback(async (enabled: boolean) => {
+    setAutoDownload(enabled);
+    setAutoDownloadEnabled(enabled);
+    if (enabled && notificationsSupported()) {
+      await requestNotificationPermission();
+    }
+  }, []);
+
+  const showTransferUi =
+    status === "connected" || status === "reconnecting" || transferActive;
   const hint = hintText(status, role);
 
   return (
     <div className="flex flex-col gap-4">
-      {/* Pairing phase */}
-      {!connected ? (
+      {!showTransferUi ? (
         <section className="panel relative">
           <div className="absolute top-4 right-4 z-10">
             <ConnectionStatus status={status} />
@@ -188,16 +245,26 @@ export function TransferPanel({
         </section>
       ) : null}
 
-      {/* Transfer phase */}
-      {connected ? (
+      {showTransferUi ? (
         <section className="panel relative">
           <div className="absolute top-4 right-4 z-10">
             <ConnectionStatus status={status} />
           </div>
           <div className="p-4 sm:p-6">
-            <p className="mt-1.5 mb-4 text-xl font-semibold text-ink">
-              Choose files to send
-            </p>
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <p className="text-xl font-semibold text-ink">
+                Choose files to send
+              </p>
+              <label className="flex cursor-pointer items-center gap-2 text-sm text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={autoDownload}
+                  onChange={(e) => void toggleAutoDownload(e.target.checked)}
+                  className="h-4 w-4 rounded border-line accent-accent"
+                />
+                Auto-download received files
+              </label>
+            </div>
             <FilePicker onSend={handleSend} sending={sending} />
           </div>
         </section>
@@ -277,7 +344,9 @@ export function TransferPanel({
             {received.length > 1 ? (
               <button
                 type="button"
-                onClick={() => received.forEach((f) => triggerDownload(f.blob, f.name))}
+                onClick={() =>
+                  received.forEach((f) => triggerDownload(f.blob, f.name))
+                }
                 className="text-xs font-semibold text-accent hover:underline"
               >
                 Download all

@@ -47,7 +47,6 @@ export async function GET(request: Request, context: RouteContext) {
   return Response.json({ messages, nextIndex });
 }
 
-// SDP + ICE candidates are small; 64 KB is generous headroom.
 const MAX_SIGNAL_BODY_BYTES = 64 * 1024;
 
 export async function POST(request: Request, context: RouteContext) {

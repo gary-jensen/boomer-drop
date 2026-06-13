@@ -24,6 +24,11 @@ const STATUS: Record<
     className: "bg-ok/10 text-ok",
     blink: false,
   },
+  reconnecting: {
+    label: "Reconnecting",
+    className: "bg-warn/10 text-warn",
+    blink: true,
+  },
   failed: {
     label: "Connection failed",
     className: "bg-error/10 text-error",

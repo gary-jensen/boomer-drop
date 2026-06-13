@@ -1,4 +1,9 @@
 import type { SignalMessage } from "@/lib/signaling";
+import { FileChunker } from "./file-chunker";
+import {
+  createSignalingTransport,
+  type SignalingTransport,
+} from "./signaling-transport";
 import { fetchIceServers } from "./ice";
 import {
   isUsefulIceCandidate,
@@ -11,6 +16,7 @@ export type ConnectionState =
   | "waiting"
   | "connecting"
   | "connected"
+  | "reconnecting"
   | "failed"
   | "closed";
 
@@ -34,6 +40,7 @@ export interface TransferSessionOptions {
   onFileSent?: (file: { name: string; size: number }) => void;
   onReceiveError?: (message: string) => void;
   onProgress: (progress: TransferProgress) => void;
+  onTransferActive?: (active: boolean) => void;
   onDebug?: (message: string) => void;
 }
 
@@ -48,22 +55,26 @@ interface FileDoneMessage {
   type: "done";
 }
 
-// 64 KB per message is the sweet spot for Safari/WebKit. Larger values
-// (e.g. 256 KB) cause Safari's SCTP to process messages more slowly
-// even when a higher max-message-size is negotiated in the SDP.
-const CHUNK_SIZE = 64 * 1024;
-// How many bytes to read from the File in one async call. Reading 4 MB at
-// a time means one `await` per 64 chunks instead of one per chunk —
-// eliminating the vast majority of async overhead on large files.
-const READ_BATCH_SIZE = 4 * 1024 * 1024;
-// Allow up to 8 MB in the send buffer before pausing. Modern browsers
-// (Chrome, Firefox, Safari) all support buffers well above this.
-const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-// Resume sending once the buffer drains below 2 MB.
-const BUFFERED_AMOUNT_LOW_THRESHOLD = 2 * 1024 * 1024;
-const POLL_INTERVAL_MS = 300;
+interface PartitionMessage {
+  type: "partition";
+  offset: number;
+}
+
+interface PartitionReceivedMessage {
+  type: "partition-received";
+  offset: number;
+}
+
+type ControlMessage =
+  | FileMetaMessage
+  | FileDoneMessage
+  | PartitionMessage
+  | PartitionReceivedMessage;
+
 const GUEST_READY_RETRY_MS = 1500;
 const ICE_GATHER_TIMEOUT_MS = 8000;
+const RECONNECT_DELAY_MS = 800;
+const PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024;
 
 function waitForIceGathering(
   peer: RTCPeerConnection,
@@ -92,13 +103,17 @@ function waitForIceGathering(
 export function createTransferSession(options: TransferSessionOptions) {
   let pc: RTCPeerConnection | null = null;
   let dc: RTCDataChannel | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let signaling: SignalingTransport | null = null;
   let guestReadyTimer: ReturnType<typeof setInterval> | null = null;
-  let messageIndex = 0;
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+
   let destroyed = false;
   let offerCreated = false;
   let makingOffer = false;
   let remoteDescriptionSet = false;
+  let reconnecting = false;
+  let transferActive = false;
+  let wasConnected = false;
 
   const pendingSignals: SignalMessage[] = [];
   const pendingIceCandidates: RTCIceCandidateInit[] = [];
@@ -108,30 +123,47 @@ export function createTransferSession(options: TransferSessionOptions) {
   let receiveBytes = 0;
   let lastProgressBytes = 0;
   let lanHost: string | null = null;
+  let iceServers: RTCIceServer[] = [];
 
-  // Only fire onProgress every 1 MB to avoid saturating the receiver's
-  // JS thread with React state updates on large files.
-  const PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024;
+  // Send state
+  let sendQueue: File[] = [];
+  let currentSendFile: File | null = null;
+  let chunker: FileChunker | null = null;
+  let lastAckedOffset = 0;
+  let partitionAckWaiter: ((offset: number) => void) | null = null;
 
   function debug(message: string): void {
     options.onDebug?.(message);
   }
 
+  function setTransferActive(active: boolean): void {
+    if (transferActive === active) return;
+    transferActive = active;
+    options.onTransferActive?.(active);
+  }
+
   async function sendSignal(message: SignalMessage): Promise<boolean> {
-    try {
-      const response = await fetch(`/api/signal/${options.roomId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: options.role, message }),
-      });
-      if (!response.ok) {
-        debug(`signal failed (${response.status}): ${message.type}`);
-      }
-      return response.ok;
-    } catch (error) {
-      debug(`signal error: ${message.type}`);
-      return false;
-    }
+    if (!signaling) return false;
+    return signaling.send(message);
+  }
+
+  function waitForPartitionAck(expectedOffset: number): Promise<void> {
+    return new Promise((resolve, reject) => {
+      partitionAckWaiter = (offset) => {
+        if (offset === expectedOffset) resolve();
+      };
+
+      const channel = dc;
+      const onClose = () => {
+        cleanup();
+        reject(new Error("Data channel closed while waiting for partition ack"));
+      };
+      const cleanup = () => {
+        partitionAckWaiter = null;
+        channel?.removeEventListener("close", onClose);
+      };
+      channel?.addEventListener("close", onClose);
+    });
   }
 
   async function flushPendingIce(): Promise<void> {
@@ -146,82 +178,197 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
   }
 
-  async function pollSignals(): Promise<void> {
-    if (destroyed) return;
+  function resetPeerFlags(): void {
+    offerCreated = false;
+    makingOffer = false;
+    remoteDescriptionSet = false;
+    pendingIceCandidates.length = 0;
+  }
 
-    try {
-      const response = await fetch(
-        `/api/signal/${options.roomId}?role=${options.role}&since=${messageIndex}`
-      );
-      if (!response.ok) {
-        if (response.status === 404) {
-          debug("room expired — rescan QR on host");
+  function closePeerConnection(): void {
+    if (dc) {
+      dc.onopen = null;
+      dc.onclose = null;
+      dc.onmessage = null;
+      dc.onerror = null;
+      try {
+        dc.close();
+      } catch {
+        // ignore
+      }
+    }
+    if (pc) {
+      pc.onicecandidate = null;
+      pc.onconnectionstatechange = null;
+      pc.oniceconnectionstatechange = null;
+      pc.ondatachannel = null;
+      try {
+        pc.close();
+      } catch {
+        // ignore
+      }
+    }
+    dc = null;
+    pc = null;
+  }
+
+  function attachPeerHandlers(peer: RTCPeerConnection): void {
+    peer.onicecandidate = (event) => {
+      if (
+        event.candidate?.candidate &&
+        isUsefulIceCandidate(event.candidate.candidate)
+      ) {
+        void sendSignal({
+          type: "ice",
+          candidate: event.candidate.toJSON(),
+        });
+      }
+    };
+
+    peer.onconnectionstatechange = () => {
+      const state = peer.connectionState;
+      debug(`connection: ${state ?? "?"}`);
+
+      if (state === "connected") {
+        wasConnected = true;
+        reconnecting = false;
+        options.onStatus("connected");
+        void logCandidatePair();
+      } else if (state === "connecting") {
+        options.onStatus("connecting");
+      } else if (state === "disconnected") {
+        if (!destroyed && wasConnected) {
+          options.onStatus("reconnecting");
+          scheduleReconnect();
         }
+      } else if (state === "failed") {
+        if (!destroyed && options.role === "host" && (transferActive || wasConnected)) {
+          options.onStatus("reconnecting");
+          scheduleReconnect();
+        } else if (!destroyed) {
+          options.onStatus("failed");
+        }
+      } else if (state === "closed") {
+        if (!destroyed && !reconnecting) {
+          options.onStatus("closed");
+        }
+      }
+    };
+
+    peer.oniceconnectionstatechange = () => {
+      debug(`ice: ${peer.iceConnectionState ?? "?"}`);
+      if (peer.iceConnectionState === "failed" && !destroyed) {
+        if (options.role === "host" && (transferActive || wasConnected)) {
+          options.onStatus("reconnecting");
+          scheduleReconnect();
+        } else {
+          options.onStatus("failed");
+        }
+      }
+    };
+  }
+
+  function setupDataChannel(channel: RTCDataChannel): void {
+    channel.binaryType = "arraybuffer";
+
+    channel.onopen = () => {
+      if (guestReadyTimer) {
+        clearInterval(guestReadyTimer);
+        guestReadyTimer = null;
+      }
+      reconnecting = false;
+      debug("data channel open");
+      options.onStatus("connected");
+      void logCandidatePair();
+
+      if (options.role === "host" && currentSendFile) {
+        void resumeSendAfterReconnect();
+      }
+    };
+
+    channel.onclose = () => {
+      debug("data channel closed");
+      if (
+        !destroyed &&
+        options.role === "host" &&
+        (transferActive || currentSendFile)
+      ) {
+        scheduleReconnect();
+      }
+    };
+
+    channel.onerror = (event) => {
+      debug(`data channel error: ${String(event)}`);
+    };
+
+    channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
+      if (typeof event.data === "string") {
+        handleControlMessage(JSON.parse(event.data) as ControlMessage);
         return;
       }
 
-      const data = (await response.json()) as {
-        messages: SignalMessage[];
-        nextIndex: number;
-      };
+      if (!receiveMeta) return;
 
-      for (const message of data.messages) {
-        await handleSignal(message);
+      try {
+        const chunk = event.data as ArrayBuffer;
+        receiveBuffer.push(chunk);
+        receiveBytes += chunk.byteLength;
+
+        const isDone = receiveBytes >= receiveMeta.size;
+        if (isDone || receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL) {
+          lastProgressBytes = receiveBytes;
+          options.onProgress({
+            fileName: receiveMeta.name,
+            sent: receiveBytes,
+            total: receiveMeta.size,
+          });
+        }
+      } catch {
+        abortReceive(
+          `Not enough memory to receive "${receiveMeta.name}". Try a smaller file or free up space on this device.`
+        );
       }
-      messageIndex = data.nextIndex;
-    } catch {
-      debug("poll error");
+    };
+  }
+
+  function handleControlMessage(parsed: ControlMessage): void {
+    switch (parsed.type) {
+      case "meta":
+        resetReceiveState();
+        receiveMeta = parsed;
+        setTransferActive(true);
+        debug(
+          `recv meta: ${parsed.name} (${(parsed.size / 1024).toFixed(1)} KB)`
+        );
+        break;
+
+      case "partition":
+        if (receiveMeta && receiveBytes >= parsed.offset) {
+          sendSignalOnChannel({
+            type: "partition-received",
+            offset: parsed.offset,
+          });
+        }
+        break;
+
+      case "partition-received":
+        partitionAckWaiter?.(parsed.offset);
+        partitionAckWaiter = null;
+        lastAckedOffset = parsed.offset;
+        break;
+
+      case "done":
+        debug(
+          `recv done: ${receiveMeta?.name ?? "?"} — got ${receiveBytes} / ${receiveMeta?.size ?? "?"} bytes`
+        );
+        finalizeReceivedFile();
+        break;
     }
   }
 
-  async function sendLocalDescription(
-    type: "offer" | "answer"
-  ): Promise<boolean> {
-    const local = pc?.localDescription;
-    if (!local?.sdp) return false;
-
-    const injectLan = options.role === "host" && type === "offer";
-    const prepared = prepareSessionDescription(local, { lanHost, injectLan });
-    debug(`${type} ${summarizeCandidates(prepared.sdp ?? "")}`);
-
-    if (injectLan && lanHost && !prepared.sdp?.includes(lanHost)) {
-      debug(`warning: could not inject ${lanHost}`);
-    }
-
-    if (!prepared.sdp?.includes("a=candidate:")) {
-      debug("warning: no usable network candidates");
-    }
-
-    return sendSignal({ type, sdp: prepared });
-  }
-
-  async function createHostOffer(): Promise<void> {
-    if (!pc || destroyed || offerCreated || makingOffer) return;
-
-    makingOffer = true;
-    options.onStatus("connecting");
-    debug("creating offer");
-
-    try {
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      await waitForIceGathering(pc, ICE_GATHER_TIMEOUT_MS);
-
-      const sent = await sendLocalDescription("offer");
-      if (sent) {
-        offerCreated = true;
-        debug("offer sent");
-      }
-    } finally {
-      makingOffer = false;
-    }
-  }
-
-  async function processPendingSignals(): Promise<void> {
-    const queued = pendingSignals.splice(0);
-    for (const message of queued) {
-      await handleSignal(message);
-    }
+  function sendSignalOnChannel(message: ControlMessage): void {
+    if (!dc || dc.readyState !== "open") return;
+    dc.send(JSON.stringify(message));
   }
 
   async function handleSignal(message: SignalMessage): Promise<void> {
@@ -241,6 +388,12 @@ export function createTransferSession(options: TransferSessionOptions) {
 
       case "offer":
         if (options.role === "guest" && message.sdp) {
+          if (wasConnected || dc?.readyState === "open") {
+            closePeerConnection();
+            resetPeerFlags();
+            pc = createPeerConnection();
+          }
+
           options.onStatus("connecting");
           debug("got offer");
           await pc.setRemoteDescription(
@@ -287,6 +440,106 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
   }
 
+  function createPeerConnection(): RTCPeerConnection {
+    const peer = new RTCPeerConnection({
+      iceServers,
+      bundlePolicy: "max-bundle",
+      iceCandidatePoolSize: 4,
+    });
+    attachPeerHandlers(peer);
+
+    if (options.role === "host") {
+      dc = peer.createDataChannel("files", { ordered: true });
+      setupDataChannel(dc);
+    } else {
+      peer.ondatachannel = (event) => {
+        dc = event.channel;
+        setupDataChannel(dc);
+        debug("data channel received");
+      };
+    }
+
+    return peer;
+  }
+
+  async function sendLocalDescription(
+    type: "offer" | "answer"
+  ): Promise<boolean> {
+    const local = pc?.localDescription;
+    if (!local?.sdp) return false;
+
+    const injectLan = options.role === "host" && type === "offer";
+    const prepared = prepareSessionDescription(local, { lanHost, injectLan });
+    debug(`${type} ${summarizeCandidates(prepared.sdp ?? "")}`);
+
+    return sendSignal({ type, sdp: prepared });
+  }
+
+  async function createHostOffer(): Promise<void> {
+    if (!pc || destroyed || offerCreated || makingOffer) return;
+
+    makingOffer = true;
+    options.onStatus("connecting");
+    debug("creating offer");
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc, ICE_GATHER_TIMEOUT_MS);
+
+      const sent = await sendLocalDescription("offer");
+      if (sent) {
+        offerCreated = true;
+        debug("offer sent");
+      }
+    } finally {
+      makingOffer = false;
+    }
+  }
+
+  function scheduleReconnect(): void {
+    if (destroyed || options.role !== "host" || reconnecting) return;
+    if (reconnectTimer) return;
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      void reconnectAsHost();
+    }, RECONNECT_DELAY_MS);
+  }
+
+  async function reconnectAsHost(): Promise<void> {
+    if (destroyed || options.role !== "host" || reconnecting) return;
+
+    reconnecting = true;
+    options.onStatus("reconnecting");
+    debug("reconnecting WebRTC");
+
+    closePeerConnection();
+    resetPeerFlags();
+
+    pc = createPeerConnection();
+    await processPendingSignals();
+
+    try {
+      await createHostOffer();
+    } catch (error) {
+      debug(`reconnect failed: ${String(error)}`);
+      reconnecting = false;
+      options.onStatus("failed");
+    }
+  }
+
+  async function resumeSendAfterReconnect(): Promise<void> {
+    if (!currentSendFile || !dc || dc.readyState !== "open") return;
+
+    debug(`resuming send at ${lastAckedOffset} bytes`);
+    try {
+      await runSendFile(currentSendFile, lastAckedOffset);
+    } catch (error) {
+      debug(`resume send failed: ${String(error)}`);
+    }
+  }
+
   function resetReceiveState(): void {
     receiveBuffer = [];
     receiveMeta = null;
@@ -296,6 +549,7 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function abortReceive(reason: string): void {
     debug(`receive error: ${reason}`);
+    setTransferActive(false);
     options.onReceiveError?.(reason);
     resetReceiveState();
   }
@@ -315,6 +569,7 @@ export function createTransferSession(options: TransferSessionOptions) {
       });
 
       resetReceiveState();
+      setTransferActive(false);
     } catch (error) {
       const isOom =
         error instanceof RangeError ||
@@ -328,175 +583,117 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
   }
 
-  function setupDataChannel(channel: RTCDataChannel): void {
-    channel.binaryType = "arraybuffer";
-    channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
-
-    channel.onopen = () => {
-      if (guestReadyTimer) {
-        clearInterval(guestReadyTimer);
-        guestReadyTimer = null;
-      }
-      debug("data channel open");
-      options.onStatus("connected");
-      void logCandidatePair();
-    };
-
-    channel.onclose = () => {
-      debug("data channel closed");
-    };
-
-    channel.onerror = (event) => {
-      debug(`data channel error: ${String(event)}`);
-    };
-
-    channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
-      if (typeof event.data === "string") {
-        const parsed = JSON.parse(event.data) as
-          | FileMetaMessage
-          | FileDoneMessage;
-
-        if (parsed.type === "meta") {
-          resetReceiveState();
-          receiveMeta = parsed;
-          debug(
-            `recv meta: ${parsed.name} (${(parsed.size / 1024).toFixed(1)} KB)`
-          );
-          return;
-        }
-
-        if (parsed.type === "done") {
-          debug(
-            `recv done: ${receiveMeta?.name ?? "?"} — got ${receiveBytes} / ${receiveMeta?.size ?? "?"} bytes`
-          );
-          finalizeReceivedFile();
-        }
-        return;
-      }
-
-      if (!receiveMeta) return;
-
-      try {
-        const chunk = event.data as ArrayBuffer;
-        receiveBuffer.push(chunk);
-        receiveBytes += chunk.byteLength;
-
-        const pct = Math.round((receiveBytes / receiveMeta.size) * 100);
-        if (pct % 25 === 0 || receiveBytes === receiveMeta.size) {
-          debug(`recv ${pct}% (${(receiveBytes / (1024 * 1024)).toFixed(1)} / ${(receiveMeta.size / (1024 * 1024)).toFixed(1)} MB)`);
-        }
-
-        const isDone = receiveBytes >= receiveMeta.size;
-        if (isDone || receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL) {
-          lastProgressBytes = receiveBytes;
-          options.onProgress({
-            fileName: receiveMeta.name,
-            sent: receiveBytes,
-            total: receiveMeta.size,
-          });
-        }
-      } catch (error) {
-        abortReceive(
-          `Not enough memory to receive "${receiveMeta.name}". Try a smaller file or free up space on this device.`
-        );
-        debug(`chunk alloc error: ${String(error)}`);
-      }
-    };
-  }
-
-  function waitForBufferDrain(channel: RTCDataChannel): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        channel.removeEventListener("bufferedamountlow", onLow);
-        channel.removeEventListener("close", onClose);
-        channel.removeEventListener("error", onError);
-      };
-      const onLow = () => { cleanup(); resolve(); };
-      const onClose = () => { cleanup(); reject(new Error("Data channel closed while waiting for buffer to drain")); };
-      const onError = () => { cleanup(); reject(new Error("Data channel error while waiting for buffer to drain")); };
-      channel.addEventListener("bufferedamountlow", onLow);
-      channel.addEventListener("close", onClose);
-      channel.addEventListener("error", onError);
-    });
-  }
-
-  async function sendFile(file: File): Promise<void> {
+  async function runSendFile(file: File, startOffset = 0): Promise<void> {
     if (!dc || dc.readyState !== "open") {
       throw new Error("Data channel is not open");
     }
 
+    currentSendFile = file;
+    lastAckedOffset = startOffset;
+    setTransferActive(true);
+
     const mbSize = (file.size / (1024 * 1024)).toFixed(1);
-    debug(`send start: ${file.name} (${mbSize} MB)`);
+    debug(
+      `send start: ${file.name} (${mbSize} MB)${startOffset ? ` from offset ${startOffset}` : ""}`
+    );
 
-    const meta: FileMetaMessage = {
-      type: "meta",
-      name: file.name,
-      size: file.size,
-      mimeType: file.type || "application/octet-stream",
-    };
-    dc.send(JSON.stringify(meta));
-
-    let offset = 0;
-
-    // Kick off the first batch read immediately so it's in flight before we
-    // enter the loop. Each iteration then starts the NEXT read before sending
-    // the current batch, overlapping disk I/O with network drain waits.
-    let nextBatchPromise = file
-      .slice(offset, Math.min(offset + READ_BATCH_SIZE, file.size))
-      .arrayBuffer();
-
-    while (offset < file.size) {
-      const batchEnd = Math.min(offset + READ_BATCH_SIZE, file.size);
-      const batch = await nextBatchPromise;
-
-      // Pre-fetch the next batch while we send the current one.
-      const nextOffset = batchEnd;
-      if (nextOffset < file.size) {
-        nextBatchPromise = file
-          .slice(nextOffset, Math.min(nextOffset + READ_BATCH_SIZE, file.size))
-          .arrayBuffer();
-      }
-
-      const batchView = new Uint8Array(batch);
-      let batchPos = 0;
-
-      while (batchPos < batch.byteLength) {
-        if (dc.bufferedAmount > MAX_BUFFERED_AMOUNT) {
-          debug(`buffer full — pausing at ${((offset + batchPos) / (1024 * 1024)).toFixed(1)} MB`);
-          // During this drain wait the next batch read runs concurrently.
-          await waitForBufferDrain(dc);
-        }
-        const end = Math.min(batchPos + CHUNK_SIZE, batch.byteLength);
-        dc.send(batchView.subarray(batchPos, end));
-        batchPos = end;
-      }
-
-      offset = batchEnd;
-
-      const pct = Math.round((offset / file.size) * 100);
-      if (pct % 10 === 0 || offset >= file.size) {
-        debug(`send ${pct}% (${(offset / (1024 * 1024)).toFixed(1)} / ${mbSize} MB)`);
-      }
-
-      options.onProgress({
-        fileName: file.name,
-        sent: offset,
-        total: file.size,
-      });
+    if (startOffset === 0) {
+      const meta: FileMetaMessage = {
+        type: "meta",
+        name: file.name,
+        size: file.size,
+        mimeType: file.type || "application/octet-stream",
+      };
+      dc.send(JSON.stringify(meta));
     }
 
-    const done: FileDoneMessage = { type: "done" };
-    dc.send(JSON.stringify(done));
-    debug(`send done: ${file.name}`);
-    options.onFileSent?.({ name: file.name, size: file.size });
+    if (file.size === 0) {
+      dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
+      options.onFileSent?.({ name: file.name, size: file.size });
+      currentSendFile = null;
+      chunker = null;
+      setTransferActive(false);
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolve();
+      };
+      const fail = (error: Error) => {
+        if (settled) return;
+        settled = true;
+        reject(error);
+      };
+
+      const startPartition = (offset: number) => {
+        chunker = new FileChunker(
+          file,
+          offset,
+          (chunk) => {
+            if (!dc || dc.readyState !== "open") {
+              fail(new Error("Data channel closed during send"));
+              return;
+            }
+            dc.send(chunk);
+          },
+          (offset) => {
+            if (!dc || dc.readyState !== "open") {
+              fail(new Error("Data channel closed during send"));
+              return;
+            }
+
+            dc.send(
+              JSON.stringify({ type: "partition", offset } satisfies PartitionMessage)
+            );
+
+            void waitForPartitionAck(offset)
+              .then(() => {
+                lastAckedOffset = offset;
+                options.onProgress({
+                  fileName: file.name,
+                  sent: offset,
+                  total: file.size,
+                });
+                if (chunker && !chunker.isFileEnd()) {
+                  startPartition(offset);
+                }
+              })
+              .catch(fail);
+          },
+          () => {
+            if (!dc || dc.readyState !== "open") {
+              fail(new Error("Data channel closed during send"));
+              return;
+            }
+            dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
+            debug(`send done: ${file.name}`);
+            options.onFileSent?.({ name: file.name, size: file.size });
+            currentSendFile = null;
+            chunker = null;
+            setTransferActive(false);
+            finish();
+          }
+        );
+        chunker.nextPartition();
+      };
+
+      startPartition(startOffset);
+    });
   }
 
-  function startPolling(): void {
-    if (pollTimer) return;
-    pollTimer = setInterval(() => {
-      void pollSignals();
-    }, POLL_INTERVAL_MS);
-    void pollSignals();
+  async function sendFile(file: File, startOffset = 0): Promise<void> {
+    await runSendFile(file, startOffset);
+  }
+
+  async function processPendingSignals(): Promise<void> {
+    const queued = pendingSignals.splice(0);
+    for (const message of queued) {
+      await handleSignal(message);
+    }
   }
 
   async function announceGuestReady(): Promise<void> {
@@ -523,7 +720,6 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   async function logCandidatePair(): Promise<void> {
     if (!pc) return;
-    // Nomination is async — wait a tick before reading stats.
     await new Promise((resolve) => setTimeout(resolve, 800));
     if (!pc) return;
     try {
@@ -549,37 +745,15 @@ export function createTransferSession(options: TransferSessionOptions) {
       stats.forEach((report) => {
         if (report.type !== "candidate-pair" || logged) return;
         const pair = report as PairReport;
-        // Different browsers use nominated, state="succeeded", or both.
         if (!pair.nominated && pair.state !== "succeeded") return;
 
-        const local = reports.get(pair.localCandidateId ?? "") as
-          | CandReport
-          | undefined;
-        const remote = reports.get(pair.remoteCandidateId ?? "") as
-          | CandReport
-          | undefined;
-
-        const localType = local?.candidateType ?? "?";
-        const remoteType = remote?.candidateType ?? "?";
-        const localAddr = local?.address
-          ? `${local.address}:${local.port}`
-          : "?";
-        const remoteAddr = remote?.address
-          ? `${remote.address}:${remote.port}`
-          : "?";
+        const local = reports.get(pair.localCandidateId ?? "") as CandReport | undefined;
+        const remote = reports.get(pair.remoteCandidateId ?? "") as CandReport | undefined;
 
         debug(
-          `ICE path: ${localType} (${localAddr}) ↔ ${remoteType} (${remoteAddr})`
+          `ICE path: ${local?.candidateType ?? "?"} ↔ ${remote?.candidateType ?? "?"}`
         );
-        if (pair.currentRoundTripTime != null) {
-          debug(`RTT: ${(pair.currentRoundTripTime * 1000).toFixed(0)} ms`);
-        }
-        if (pair.availableOutgoingBitrate != null) {
-          debug(
-            `available bandwidth: ${(pair.availableOutgoingBitrate / 1_000_000).toFixed(1)} Mbps`
-          );
-        }
-        if (localType === "relay" || remoteType === "relay") {
+        if (local?.candidateType === "relay" || remote?.candidateType === "relay") {
           debug("⚠ TURN relay active — speeds will be limited");
         }
         logged = true;
@@ -597,16 +771,15 @@ export function createTransferSession(options: TransferSessionOptions) {
 
     try {
       debug("loading ICE config");
-      const [iceServers, config] = await Promise.all([
+      const [servers, config] = await Promise.all([
         fetchIceServers(),
         fetch("/api/config")
           .then((response) => response.json() as Promise<{ lanHost?: string }>)
           .catch(() => ({ lanHost: null })),
       ]);
+      iceServers = servers;
       lanHost = config.lanHost ?? null;
-      if (lanHost && options.role === "host") {
-        debug(`LAN host: ${lanHost}`);
-      }
+
       if (destroyed) return;
 
       if (typeof RTCPeerConnection === "undefined") {
@@ -615,56 +788,19 @@ export function createTransferSession(options: TransferSessionOptions) {
         return;
       }
 
-      pc = new RTCPeerConnection({
-        iceServers,
-        bundlePolicy: "max-bundle",
-        iceCandidatePoolSize: 4,
+      signaling = await createSignalingTransport({
+        roomId: options.roomId,
+        role: options.role,
+        onMessage: (message) => {
+          void handleSignal(message);
+        },
+        onDebug: debug,
       });
 
-      pc.onicecandidate = (event) => {
-        if (
-          event.candidate?.candidate &&
-          isUsefulIceCandidate(event.candidate.candidate)
-        ) {
-          void sendSignal({
-            type: "ice",
-            candidate: event.candidate.toJSON(),
-          });
-        }
-      };
-
-      pc.onconnectionstatechange = () => {
-        const state = pc?.connectionState;
-        debug(`connection: ${state ?? "?"}`);
-        if (state === "connected") {
-          options.onStatus("connected");
-          void logCandidatePair();
-        } else if (state === "connecting") options.onStatus("connecting");
-        else if (state === "failed") options.onStatus("failed");
-        else if (state === "closed") options.onStatus("closed");
-      };
-
-      pc.oniceconnectionstatechange = () => {
-        debug(`ice: ${pc?.iceConnectionState ?? "?"}`);
-        if (pc?.iceConnectionState === "failed") {
-          options.onStatus("failed");
-        }
-      };
-
-      if (options.role === "host") {
-        dc = pc.createDataChannel("files", { ordered: true });
-        setupDataChannel(dc);
-        debug("host ready");
-      } else {
-        pc.ondatachannel = (event) => {
-          dc = event.channel;
-          setupDataChannel(dc);
-          debug("data channel received");
-        };
-      }
+      pc = createPeerConnection();
+      debug(`${options.role} ready (${signaling.mode})`);
 
       await processPendingSignals();
-      startPolling();
 
       if (options.role === "guest") {
         startGuestReadyRetries();
@@ -676,25 +812,29 @@ export function createTransferSession(options: TransferSessionOptions) {
   }
 
   async function sendFiles(files: File[]): Promise<void> {
-    for (const file of files) {
+    sendQueue = [...files];
+    while (sendQueue.length > 0) {
+      const file = sendQueue.shift()!;
       await sendFile(file);
     }
   }
 
   function destroy(): void {
     destroyed = true;
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
+    setTransferActive(false);
+
     if (guestReadyTimer) {
       clearInterval(guestReadyTimer);
       guestReadyTimer = null;
     }
-    dc?.close();
-    pc?.close();
-    dc = null;
-    pc = null;
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    signaling?.destroy();
+    signaling = null;
+    closePeerConnection();
   }
 
   return {
