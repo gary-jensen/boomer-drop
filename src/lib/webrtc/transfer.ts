@@ -84,8 +84,9 @@ const PARTITION_ACK_TIMEOUT_MS = 90_000;
 const SEND_HEARTBEAT_MS = 10_000;
 const RECV_NOTIFY_INTERVAL_MS = 250;
 const IN_MEMORY_SEND_MAX = 256 * 1024 * 1024;
-const MAX_SEND_BUFFER = 16 * 1024 * 1024;
-const SEND_BUFFER_LOW = 4 * 1024 * 1024;
+/** Pause sending above this; resume only after draining to SEND_BUFFER_LOW. */
+const MAX_SEND_BUFFER = 2 * 1024 * 1024;
+const SEND_BUFFER_LOW = 512 * 1024;
 
 export function createTransferSession(options: TransferSessionOptions) {
   let pc: RTCPeerConnection | null = null;
@@ -180,7 +181,8 @@ export function createTransferSession(options: TransferSessionOptions) {
           reject(new Error("Data channel closed while sending"));
           return;
         }
-        if (channel.bufferedAmount <= MAX_SEND_BUFFER) {
+        // Hysteresis: wait for a real drain, not just one byte below the cap.
+        if (channel.bufferedAmount <= SEND_BUFFER_LOW) {
           cleanup();
           resolve();
         }
@@ -310,6 +312,7 @@ export function createTransferSession(options: TransferSessionOptions) {
         offset % MAX_PARTITION_SIZE === 0 &&
         offset < view.byteLength
       ) {
+        await waitForSendBufferDrain(dc);
         sendPartitionMessage(offset);
       }
     }
@@ -663,7 +666,10 @@ export function createTransferSession(options: TransferSessionOptions) {
     };
 
     channel.onerror = (event) => {
-      debug(`data channel error: ${String(event)}`);
+      const rtcError = (event as RTCErrorEvent).error;
+      debug(
+        `data channel error: ${rtcError?.message ?? rtcError?.errorDetail ?? String(event)}`
+      );
     };
 
     channel.onmessage = (event: MessageEvent<string | ArrayBuffer>) => {
@@ -1067,68 +1073,82 @@ export function createTransferSession(options: TransferSessionOptions) {
     if (!pc) return;
     await new Promise((resolve) => setTimeout(resolve, 800));
     if (!pc) return;
+
+    type CandReport = RTCStats & {
+      candidateType?: string;
+      address?: string;
+      ip?: string;
+      port?: number;
+      protocol?: string;
+      networkType?: string;
+    };
+    type PairReport = RTCStats & {
+      nominated?: boolean;
+      state?: string;
+      localCandidateId?: string;
+      remoteCandidateId?: string;
+      currentRoundTripTime?: number;
+      availableOutgoingBitrate?: number;
+    };
+
+    const describe = (cand: CandReport | undefined): string => {
+      if (!cand) return "?";
+      const addr = cand.address ?? cand.ip ?? "?";
+      const fam = addr.includes(":") ? "v6" : "v4";
+      return `${cand.candidateType ?? "?"}/${cand.protocol ?? "?"}/${fam}@${addr}`;
+    };
+
     try {
       const stats = await pc.getStats();
       const reports = new Map<string, RTCStats>();
       stats.forEach((r) => reports.set(r.id, r));
 
-      type CandReport = RTCStats & {
-        candidateType?: string;
-        address?: string;
-        port?: number;
-      };
-      type PairReport = RTCStats & {
-        nominated?: boolean;
-        state?: string;
-        localCandidateId?: string;
-        remoteCandidateId?: string;
-        currentRoundTripTime?: number;
-        availableOutgoingBitrate?: number;
-      };
-
-      let logged = false;
+      const pairs: PairReport[] = [];
       stats.forEach((report) => {
-        if (report.type !== "candidate-pair" || logged) return;
-        const pair = report as PairReport;
-        if (!pair.nominated && pair.state !== "succeeded") return;
-
-        const local = reports.get(pair.localCandidateId ?? "") as CandReport | undefined;
-        const remote = reports.get(pair.remoteCandidateId ?? "") as CandReport | undefined;
-
-        const localType = local?.candidateType ?? "?";
-        const remoteType = remote?.candidateType ?? "?";
-        activeCandidatePair = {
-          localType,
-          remoteType,
-          localAddress: local?.address,
-          remoteAddress: remote?.address,
-        };
-
-        debug(
-          `ICE path: ${localType} ↔ ${remoteType}` +
-            (local?.address || remote?.address
-              ? ` (${local?.address ?? "?"} ↔ ${remote?.address ?? "?"})`
-              : "")
-        );
-        if (localType === "relay" || remoteType === "relay") {
-          debug("⚠ TURN relay — expect slower speeds");
-        } else if (localType !== "host" || remoteType !== "host") {
-          debug(
-            "⚠ not a direct LAN path — if both devices are on the same Wi‑Fi, speeds may be much slower than expected"
-          );
-        }
-        if (pair.currentRoundTripTime) {
-          debug(`ICE RTT: ${Math.round(pair.currentRoundTripTime * 1000)} ms`);
-        }
-        if (pair.availableOutgoingBitrate) {
-          debug(
-            `ICE estimated uplink: ${(pair.availableOutgoingBitrate / (1024 * 1024)).toFixed(1)} Mbps`
-          );
-        }
-        logged = true;
+        if (report.type === "candidate-pair") pairs.push(report as PairReport);
       });
 
-      if (!logged) debug("ICE path: no active candidate pair found");
+      // Dump every candidate pair so we can see which routes were available,
+      // not just the one ICE selected. Helps explain a slow path vs alternatives.
+      for (const pair of pairs) {
+        const local = reports.get(pair.localCandidateId ?? "") as CandReport | undefined;
+        const remote = reports.get(pair.remoteCandidateId ?? "") as CandReport | undefined;
+        const selected = pair.nominated || pair.state === "succeeded";
+        const rtt = pair.currentRoundTripTime
+          ? ` rtt=${Math.round(pair.currentRoundTripTime * 1000)}ms`
+          : "";
+        const bitrate = pair.availableOutgoingBitrate
+          ? ` up=${(pair.availableOutgoingBitrate / 1_000_000).toFixed(1)}Mbps`
+          : "";
+        debug(
+          `ICE pair${selected ? " *SELECTED*" : ""} [${pair.state ?? "?"}] ${describe(local)} ↔ ${describe(remote)}${rtt}${bitrate}`
+        );
+      }
+
+      const active = pairs.find((p) => p.nominated || p.state === "succeeded");
+      if (!active) {
+        debug("ICE path: no active candidate pair found");
+        return;
+      }
+
+      const local = reports.get(active.localCandidateId ?? "") as CandReport | undefined;
+      const remote = reports.get(active.remoteCandidateId ?? "") as CandReport | undefined;
+      const localType = local?.candidateType ?? "?";
+      const remoteType = remote?.candidateType ?? "?";
+      activeCandidatePair = {
+        localType,
+        remoteType,
+        localAddress: local?.address ?? local?.ip,
+        remoteAddress: remote?.address ?? remote?.ip,
+      };
+
+      if (localType === "relay" || remoteType === "relay") {
+        debug("⚠ TURN relay — expect slower speeds");
+      } else if (localType === "srflx" && remoteType === "srflx") {
+        debug("direct P2P via STUN (srflx ↔ srflx) — best non-LAN path");
+      } else if (localType !== "host" || remoteType !== "host") {
+        debug("⚠ asymmetric path — a better candidate pair may exist (see ICE pair list above)");
+      }
     } catch {
       debug("could not read ICE stats");
     }
