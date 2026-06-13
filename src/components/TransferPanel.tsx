@@ -22,7 +22,7 @@ import { FilePicker } from "./FilePicker";
 import { QRDisplay } from "./QRDisplay";
 import { VerificationBadge } from "./VerificationBadge";
 
-const SHOW_TRANSFER_LOG = false;
+const SHOW_TRANSFER_LOG = true;
 
 function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
@@ -172,21 +172,31 @@ export function TransferPanel({
 
   const handleSend = useCallback(async (files: File[]) => {
     if (!sessionRef.current) return;
+    if (status !== "connected") {
+      setSendError("Not connected yet — wait for Connected before sending.");
+      return;
+    }
     setSending(true);
     setSendError(null);
+    if (files[0]) {
+      setProgress({ fileName: files[0].name, sent: 0, total: files[0].size });
+    }
+    addDebug(`UI: sending ${files.length} file(s)`);
     try {
       await sessionRef.current.sendFiles(files);
+      addDebug("UI: send finished");
     } catch (error) {
-      setSendError(
+      const message =
         error instanceof Error
           ? error.message
-          : "Something went wrong while sending. Please try again."
-      );
+          : "Something went wrong while sending. Please try again.";
+      addDebug(`UI: send error — ${message}`);
+      setSendError(message);
     } finally {
       setSending(false);
       setProgress(null);
     }
-  }, []);
+  }, [status, addDebug]);
 
   const handleRetry = useCallback(() => {
     setDebugLog([]);
@@ -265,7 +275,11 @@ export function TransferPanel({
                 Auto-download received files
               </label>
             </div>
-            <FilePicker onSend={handleSend} sending={sending} />
+            <FilePicker
+              onSend={handleSend}
+              sending={sending}
+              disabled={status !== "connected"}
+            />
           </div>
         </section>
       ) : null}
@@ -384,7 +398,7 @@ export function TransferPanel({
         </section>
       ) : null}
 
-      {SHOW_TRANSFER_LOG && debugLog.length > 0 ? (
+      {(SHOW_TRANSFER_LOG || sending || transferActive) && debugLog.length > 0 ? (
         <section className="panel overflow-hidden">
           <p className="border-b border-line px-4 py-2 text-xs font-semibold uppercase tracking-wider text-ink-faint">
             Transfer log
@@ -392,6 +406,15 @@ export function TransferPanel({
           <pre className="max-h-48 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-relaxed text-ink-soft">
             {debugLog.join("\n")}
           </pre>
+        </section>
+      ) : null}
+
+      {sending && !progress ? (
+        <section className="panel px-4 py-4 sm:px-6 sm:py-5">
+          <p className="text-sm font-medium text-ink">Preparing transfer…</p>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-ink/8">
+            <div className="h-full w-1/3 animate-pulse rounded-full bg-accent" />
+          </div>
         </section>
       ) : null}
     </div>

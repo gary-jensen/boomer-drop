@@ -75,9 +75,10 @@ const GUEST_READY_RETRY_MS = 1500;
 const ICE_GATHER_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 800;
 const PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024;
-const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
-const BUFFERED_AMOUNT_LOW_THRESHOLD = 2 * 1024 * 1024;
+const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
+const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024;
 const PARTITION_ACK_TIMEOUT_MS = 60_000;
+const SEND_BUFFER_TIMEOUT_MS = 20_000;
 
 function waitForIceGathering(
   peer: RTCPeerConnection,
@@ -138,6 +139,9 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function debug(message: string): void {
     options.onDebug?.(message);
+    if (typeof console !== "undefined") {
+      console.log(`[BoomerDrop] ${message}`);
+    }
   }
 
   function setTransferActive(active: boolean): void {
@@ -191,14 +195,26 @@ export function createTransferSession(options: TransferSessionOptions) {
 
     return new Promise((resolve, reject) => {
       const cleanup = () => {
+        clearTimeout(timer);
+        clearInterval(poll);
         channel.removeEventListener("bufferedamountlow", onLow);
         channel.removeEventListener("close", onClose);
         channel.removeEventListener("error", onError);
       };
-      const onLow = () => {
-        cleanup();
-        resolve();
+
+      const tryResolve = () => {
+        if (channel.readyState !== "open") {
+          cleanup();
+          reject(new Error("Data channel closed while waiting to send"));
+          return;
+        }
+        if (channel.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
+          cleanup();
+          resolve();
+        }
       };
+
+      const onLow = () => tryResolve();
       const onClose = () => {
         cleanup();
         reject(new Error("Data channel closed while waiting to send"));
@@ -207,18 +223,48 @@ export function createTransferSession(options: TransferSessionOptions) {
         cleanup();
         reject(new Error("Data channel error while waiting to send"));
       };
+
+      // Safari often skips bufferedamountlow — poll as a backup.
+      const poll = setInterval(tryResolve, 250);
+
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Send buffer stalled (${(channel.bufferedAmount / 1024).toFixed(0)} KB queued)`
+          )
+        );
+      }, SEND_BUFFER_TIMEOUT_MS);
+
       channel.addEventListener("bufferedamountlow", onLow);
       channel.addEventListener("close", onClose);
       channel.addEventListener("error", onError);
     });
   }
 
-  async function sendBinaryChunk(chunk: ArrayBuffer): Promise<void> {
+  let sendBytesQueued = 0;
+  let lastSendProgressBytes = 0;
+
+  function reportSendProgress(file: File, sent: number): void {
+    if (sent - lastSendProgressBytes < PROGRESS_UPDATE_INTERVAL && sent < file.size) {
+      return;
+    }
+    lastSendProgressBytes = sent;
+    options.onProgress({
+      fileName: file.name,
+      sent,
+      total: file.size,
+    });
+  }
+
+  async function sendBinaryChunk(file: File, chunk: ArrayBuffer): Promise<void> {
     if (!dc || dc.readyState !== "open") {
       throw new Error("Data channel is not open");
     }
     await waitForSendBuffer(dc);
     dc.send(chunk);
+    sendBytesQueued += chunk.byteLength;
+    reportSendProgress(file, sendBytesQueued);
   }
 
   function trySendPartitionAck(offset: number): void {
@@ -665,12 +711,15 @@ export function createTransferSession(options: TransferSessionOptions) {
 
     currentSendFile = file;
     lastAckedOffset = startOffset;
+    sendBytesQueued = startOffset;
+    lastSendProgressBytes = startOffset;
     setTransferActive(true);
 
     const mbSize = (file.size / (1024 * 1024)).toFixed(1);
     debug(
       `send start: ${file.name} (${mbSize} MB)${startOffset ? ` from offset ${startOffset}` : ""}`
     );
+    options.onProgress({ fileName: file.name, sent: startOffset, total: file.size });
 
     if (startOffset === 0) {
       const meta: FileMetaMessage = {
@@ -709,7 +758,7 @@ export function createTransferSession(options: TransferSessionOptions) {
           file,
           offset,
           async (chunk) => {
-            await sendBinaryChunk(chunk);
+            await sendBinaryChunk(file, chunk);
           },
           (partitionOffset) => {
             if (!dc || dc.readyState !== "open") {
