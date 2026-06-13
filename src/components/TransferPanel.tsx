@@ -24,6 +24,20 @@ import { VerificationBadge } from "./VerificationBadge";
 
 const SHOW_TRANSFER_LOG = true;
 
+function formatTransferRate(bytesPerSec: number): string {
+  if (bytesPerSec >= 1024 * 1024) {
+    return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
+  }
+  return `${(bytesPerSec / 1024).toFixed(0)} KB/s`;
+}
+
+function formatEta(remainingBytes: number, bytesPerSec: number): string | null {
+  if (bytesPerSec <= 0 || remainingBytes <= 0) return null;
+  const seconds = Math.ceil(remainingBytes / bytesPerSec);
+  if (seconds < 60) return `~${seconds}s left`;
+  if (seconds < 3600) return `~${Math.ceil(seconds / 60)} min left`;
+  return `~${(seconds / 3600).toFixed(1)} hr left`;
+}
 function formatFileSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
   if (bytes < 1024 * 1024 * 1024)
@@ -86,6 +100,28 @@ export function TransferPanel({
   const sessionRef = useRef<ReturnType<typeof createTransferSession> | null>(
     null
   );
+  const rateSampleRef = useRef<{ at: number; sent: number } | null>(null);
+  const [transferRate, setTransferRate] = useState<number | null>(null);
+
+  useEffect(() => {
+    if (!progress) {
+      rateSampleRef.current = null;
+      setTransferRate(null);
+      return;
+    }
+
+    const now = Date.now();
+    const sample = rateSampleRef.current;
+    if (sample && now - sample.at >= 1000) {
+      const bytesPerSec = (progress.sent - sample.sent) / ((now - sample.at) / 1000);
+      if (bytesPerSec > 0) {
+        setTransferRate(bytesPerSec);
+      }
+      rateSampleRef.current = { at: now, sent: progress.sent };
+    } else if (!sample) {
+      rateSampleRef.current = { at: now, sent: progress.sent };
+    }
+  }, [progress]);
 
   const addDebug = useCallback((message: string) => {
     const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -304,22 +340,45 @@ export function TransferPanel({
 
       {progress ? (
         <section className="panel px-4 py-4 sm:px-6 sm:py-5">
-          <div className="flex items-baseline justify-between gap-2">
-            <p className="truncate text-sm font-medium text-ink">
-              {progress.fileName}
-            </p>
-            <p className="shrink-0 text-sm font-semibold text-accent">
-              {Math.round((progress.sent / progress.total) * 100)}%
-            </p>
-          </div>
-          <div className="mt-3 h-2 overflow-hidden rounded-full bg-ink/8">
-            <div
-              className="h-full rounded-full bg-accent transition-all duration-300"
-              style={{
-                width: `${Math.min(100, (progress.sent / progress.total) * 100)}%`,
-              }}
-            />
-          </div>
+          {(() => {
+            const pct = (progress.sent / progress.total) * 100;
+            const isLarge = progress.total >= 10 * 1024 * 1024;
+            const eta =
+              transferRate !== null
+                ? formatEta(progress.total - progress.sent, transferRate)
+                : null;
+
+            return (
+              <>
+                <div className="flex items-baseline justify-between gap-2">
+                  <p className="truncate text-sm font-medium text-ink">
+                    {progress.fileName}
+                  </p>
+                  <p className="shrink-0 text-sm font-semibold text-accent">
+                    {isLarge ? pct.toFixed(1) : Math.round(pct)}%
+                  </p>
+                </div>
+                <p className="mt-1 text-xs text-ink-soft">
+                  {formatFileSize(progress.sent)} / {formatFileSize(progress.total)}
+                  {transferRate !== null ? (
+                    <>
+                      {" "}
+                      · {formatTransferRate(transferRate)}
+                      {eta ? ` · ${eta}` : ""}
+                    </>
+                  ) : null}
+                </p>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-ink/8">
+                  <div
+                    className="h-full rounded-full bg-accent transition-all duration-300"
+                    style={{
+                      width: `${Math.min(100, pct)}%`,
+                    }}
+                  />
+                </div>
+              </>
+            );
+          })()}
         </section>
       ) : null}
 

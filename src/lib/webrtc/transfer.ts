@@ -4,6 +4,7 @@ import {
   type SignalingTransport,
 } from "./signaling-transport";
 import { fetchIceServers } from "./ice";
+import { FileChunker } from "./file-chunker";
 import {
   isUsefulIceCandidate,
   prepareSessionDescription,
@@ -54,17 +55,56 @@ interface FileDoneMessage {
   type: "done";
 }
 
-type ControlMessage = FileMetaMessage | FileDoneMessage;
+interface PartitionMessage {
+  type: "partition";
+  offset: number;
+}
 
-const CHUNK_SIZE = 64 * 1024;
+interface PartitionReceivedMessage {
+  type: "partition-received";
+  offset: number;
+}
+
+type ControlMessage =
+  | FileMetaMessage
+  | FileDoneMessage
+  | PartitionMessage
+  | PartitionReceivedMessage;
+
+function extractPrivateHostIp(sdp: string): string | null {
+  for (const line of sdp.split(/\r?\n/)) {
+    if (!line.startsWith("a=candidate:")) continue;
+    const parts = line.split(" ");
+    const ip = parts[4];
+    if (!ip || ip.includes(".local")) continue;
+    if (
+      /^10\./.test(ip) ||
+      /^192\.168\./.test(ip) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(ip)
+    ) {
+      return ip;
+    }
+  }
+  return null;
+}
+
+function hasTurnServer(servers: RTCIceServer[]): boolean {
+  return servers.some((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    return urls.some(
+      (url) => typeof url === "string" && url.startsWith("turn")
+    );
+  });
+}
+
 const GUEST_READY_RETRY_MS = 1500;
 const ICE_GATHER_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 800;
-const PROGRESS_UPDATE_INTERVAL = 256 * 1024;
-const DEBUG_LOG_INTERVAL = 256 * 1024;
-const MAX_BUFFERED_AMOUNT = 4 * 1024 * 1024;
-const BUFFERED_AMOUNT_LOW_THRESHOLD = 1 * 1024 * 1024;
-const SEND_BUFFER_TIMEOUT_MS = 20_000;
+const PROGRESS_UI_INTERVAL_MS = 500;
+const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024;
+const PARTITION_ACK_TIMEOUT_MS = 90_000;
+const SEND_HEARTBEAT_MS = 10_000;
+const RECV_NOTIFY_INTERVAL_MS = 250;
 
 function waitForIceGathering(
   peer: RTCPeerConnection,
@@ -108,11 +148,14 @@ export function createTransferSession(options: TransferSessionOptions) {
   const pendingSignals: SignalMessage[] = [];
   const pendingIceCandidates: RTCIceCandidateInit[] = [];
 
-  let receiveBuffer: ArrayBuffer[] = [];
+  let receiveTarget: Uint8Array | null = null;
+  let receiveFallbackChunks: ArrayBuffer[] = [];
   let receiveMeta: FileMetaMessage | null = null;
   let receiveBytes = 0;
-  let lastProgressBytes = 0;
-  let lastDebugRecvBytes = 0;
+  let lastLoggedRecvPct = -1;
+  let progressFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastProgressUiAt = 0;
+  let pendingProgress: TransferProgress | null = null;
   let lanHost: string | null = null;
   let iceServers: RTCIceServer[] = [];
 
@@ -120,6 +163,14 @@ export function createTransferSession(options: TransferSessionOptions) {
   let sendQueue: File[] = [];
   let currentSendFile: File | null = null;
   let lastAckedOffset = 0;
+  let sendHeartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  let lastSendActivityAt = 0;
+  let abortSend: ((error: Error) => void) | null = null;
+  let recvNotifyTimer: ReturnType<typeof setTimeout> | null = null;
+  let fileChunker: FileChunker | null = null;
+  let partitionAckTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastStatsBytesSent = 0;
+  let lastStatsAt = 0;
 
   function debug(message: string): void {
     options.onDebug?.(message);
@@ -139,91 +190,190 @@ export function createTransferSession(options: TransferSessionOptions) {
     return signaling.send(message);
   }
 
-  function waitForSendBuffer(channel: RTCDataChannel): Promise<void> {
-    if (channel.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
-      return Promise.resolve();
-    }
-
-    channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
-
-    return new Promise((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timer);
-        clearInterval(poll);
-        channel.removeEventListener("bufferedamountlow", onLow);
-        channel.removeEventListener("close", onClose);
-        channel.removeEventListener("error", onError);
-      };
-
-      const tryResolve = () => {
-        if (channel.readyState !== "open") {
-          cleanup();
-          reject(new Error("Data channel closed while waiting to send"));
-          return;
-        }
-        if (channel.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
-          cleanup();
-          resolve();
-        }
-      };
-
-      const onLow = () => tryResolve();
-      const onClose = () => {
-        cleanup();
-        reject(new Error("Data channel closed while waiting to send"));
-      };
-      const onError = () => {
-        cleanup();
-        reject(new Error("Data channel error while waiting to send"));
-      };
-
-      // Safari often skips bufferedamountlow — poll as a backup.
-      const poll = setInterval(tryResolve, 250);
-
-      const timer = setTimeout(() => {
-        cleanup();
-        reject(
-          new Error(
-            `Send buffer stalled (${(channel.bufferedAmount / 1024).toFixed(0)} KB queued)`
-          )
-        );
-      }, SEND_BUFFER_TIMEOUT_MS);
-
-      channel.addEventListener("bufferedamountlow", onLow);
-      channel.addEventListener("close", onClose);
-      channel.addEventListener("error", onError);
-    });
+  function failActiveSend(message: string): void {
+    abortSend?.(new Error(message));
   }
 
-  let sendBytesQueued = 0;
-  let lastSendProgressBytes = 0;
-
-  function reportSendProgress(file: File, sent: number): void {
-    if (sent - lastSendProgressBytes < PROGRESS_UPDATE_INTERVAL && sent < file.size) {
-      return;
-    }
-    lastSendProgressBytes = sent;
-    options.onProgress({
-      fileName: file.name,
-      sent,
-      total: file.size,
-    });
+  function clearPartitionAckTimer(): void {
+    if (!partitionAckTimer) return;
+    clearTimeout(partitionAckTimer);
+    partitionAckTimer = null;
   }
 
-  async function sendBinaryChunk(file: File, chunk: ArrayBuffer): Promise<void> {
+  function stopFileChunker(): void {
+    fileChunker = null;
+    clearPartitionAckTimer();
+  }
+
+  function sendRawChunk(file: File, chunk: ArrayBuffer): void {
     if (!dc || dc.readyState !== "open") {
       throw new Error("Data channel is not open");
     }
-    await waitForSendBuffer(dc);
-    try {
-      dc.send(chunk);
-    } catch (error) {
-      throw new Error(
-        `Failed to send chunk: ${error instanceof Error ? error.message : String(error)}`
-      );
-    }
+    dc.send(chunk);
     sendBytesQueued += chunk.byteLength;
-    reportSendProgress(file, sendBytesQueued);
+    lastAckedOffset = sendBytesQueued;
+    lastSendActivityAt = Date.now();
+    scheduleProgress(file.name, sendBytesQueued, file.size);
+  }
+
+  function onPartitionEnd(file: File, offset: number): void {
+    if (!dc || dc.readyState !== "open") {
+      failActiveSend("Data channel closed during send");
+      return;
+    }
+
+    dc.send(JSON.stringify({ type: "partition", offset } satisfies PartitionMessage));
+    debug(`send partition @ ${(offset / (1024 * 1024)).toFixed(1)} MB`);
+
+    clearPartitionAckTimer();
+    partitionAckTimer = setTimeout(() => {
+      failActiveSend(
+        `Timed out waiting for receiver at ${(offset / (1024 * 1024)).toFixed(1)} MB`
+      );
+    }, PARTITION_ACK_TIMEOUT_MS);
+  }
+
+  function onPartitionReceived(offset: number): void {
+    clearPartitionAckTimer();
+    if (!fileChunker) return;
+    debug(`partition ack @ ${(offset / (1024 * 1024)).toFixed(1)} MB`);
+    fileChunker.nextPartition();
+  }
+
+  let sendBytesQueued = 0;
+  let lastLoggedSendPct = -1;
+
+  function flushProgress(force = false): void {
+    if (!pendingProgress) return;
+    const now = Date.now();
+    const done = pendingProgress.sent >= pendingProgress.total;
+    if (!force && !done && now - lastProgressUiAt < PROGRESS_UI_INTERVAL_MS) {
+      return;
+    }
+    lastProgressUiAt = now;
+    options.onProgress(pendingProgress);
+    if (done) pendingProgress = null;
+  }
+
+  function scheduleProgress(fileName: string, sent: number, total: number): void {
+    pendingProgress = { fileName, sent, total };
+    flushProgress(sent >= total);
+    if (sent >= total || progressFlushTimer) return;
+    progressFlushTimer = setTimeout(() => {
+      progressFlushTimer = null;
+      flushProgress(true);
+    }, PROGRESS_UI_INTERVAL_MS);
+  }
+
+  function logTransferProgress(
+    direction: "send" | "recv",
+    bytes: number,
+    total: number,
+    lastLoggedPct: number
+  ): number {
+    const pct = Math.min(100, Math.floor((bytes / total) * 100));
+    const step = total >= LARGE_FILE_THRESHOLD ? 5 : 1;
+    if (pct < lastLoggedPct + step && bytes < total) return lastLoggedPct;
+    debug(
+      `${direction} ${pct}% (${(bytes / (1024 * 1024)).toFixed(1)} MB)`
+    );
+    return pct;
+  }
+
+  function scheduleReceiveNotify(): void {
+    if (recvNotifyTimer) return;
+    recvNotifyTimer = setTimeout(() => {
+      recvNotifyTimer = null;
+      if (!receiveMeta) return;
+
+      scheduleProgress(receiveMeta.name, receiveBytes, receiveMeta.size);
+      lastLoggedRecvPct = logTransferProgress(
+        "recv",
+        receiveBytes,
+        receiveMeta.size,
+        lastLoggedRecvPct
+      );
+    }, RECV_NOTIFY_INTERVAL_MS);
+  }
+
+  function clearReceiveNotify(): void {
+    if (!recvNotifyTimer) return;
+    clearTimeout(recvNotifyTimer);
+    recvNotifyTimer = null;
+  }
+
+  async function logTransferStats(file: File): Promise<void> {
+    if (!pc) return;
+    try {
+      const stats = await pc.getStats();
+      type PairReport = RTCStats & {
+        nominated?: boolean;
+        state?: string;
+        bytesSent?: number;
+        bytesReceived?: number;
+        currentRoundTripTime?: number;
+        availableOutgoingBitrate?: number;
+      };
+
+      let pairReport: PairReport | undefined;
+      stats.forEach((report) => {
+        if (report.type !== "candidate-pair") return;
+        const pair = report as PairReport;
+        if (pair.nominated || pair.state === "succeeded") {
+          pairReport = pair;
+        }
+      });
+
+      const now = Date.now();
+      const parts: string[] = [];
+      const bytesSent = pairReport?.bytesSent;
+
+      if (bytesSent !== undefined && lastStatsAt > 0) {
+        const dt = (now - lastStatsAt) / 1000;
+        const ds = bytesSent - lastStatsBytesSent;
+        if (dt > 0 && ds > 0) {
+          parts.push(`link ${(ds / dt / 1024).toFixed(0)} KB/s`);
+        }
+        lastStatsBytesSent = bytesSent;
+        lastStatsAt = now;
+      } else if (bytesSent !== undefined) {
+        lastStatsBytesSent = bytesSent;
+        lastStatsAt = now;
+      }
+
+      if (dc && dc.bufferedAmount > 0) {
+        parts.push(`buffer ${(dc.bufferedAmount / 1024).toFixed(0)} KB`);
+      }
+
+      if (parts.length > 0) {
+        debug(`send stats: ${parts.join(", ")}`);
+      }
+    } catch {
+      // ignore stats errors
+    }
+  }
+
+  function startSendHeartbeat(file: File): void {
+    stopSendHeartbeat();
+    lastSendActivityAt = Date.now();
+    lastStatsAt = Date.now();
+    lastStatsBytesSent = 0;
+    sendHeartbeatTimer = setInterval(() => {
+      if (!currentSendFile) return;
+      void logTransferStats(file);
+      const idleMs = Date.now() - lastSendActivityAt;
+      if (idleMs < SEND_HEARTBEAT_MS) return;
+      const pct = ((sendBytesQueued / file.size) * 100).toFixed(1);
+      debug(
+        `send still running: ${pct}% (${(sendBytesQueued / (1024 * 1024)).toFixed(1)} MB), idle ${Math.round(idleMs / 1000)}s`
+      );
+    }, SEND_HEARTBEAT_MS);
+  }
+
+  function stopSendHeartbeat(): void {
+    if (!sendHeartbeatTimer) return;
+    clearInterval(sendHeartbeatTimer);
+    sendHeartbeatTimer = null;
   }
 
   async function flushPendingIce(): Promise<void> {
@@ -300,8 +450,14 @@ export function createTransferSession(options: TransferSessionOptions) {
         debug("connection temporarily disconnected");
         if (!destroyed && transferActive) {
           options.onStatus("reconnecting");
+          if (currentSendFile && options.role === "guest") {
+            failActiveSend("Connection lost during send");
+          }
         }
       } else if (state === "failed") {
+        if (currentSendFile && options.role === "guest") {
+          failActiveSend("Connection failed during send");
+        }
         if (!destroyed && options.role === "host" && (transferActive || wasConnected)) {
           options.onStatus("reconnecting");
           scheduleReconnect();
@@ -309,6 +465,9 @@ export function createTransferSession(options: TransferSessionOptions) {
           options.onStatus("failed");
         }
       } else if (state === "closed") {
+        if (currentSendFile) {
+          failActiveSend("Connection closed during send");
+        }
         if (!destroyed && !reconnecting) {
           options.onStatus("closed");
         }
@@ -318,6 +477,9 @@ export function createTransferSession(options: TransferSessionOptions) {
     peer.oniceconnectionstatechange = () => {
       debug(`ice: ${peer.iceConnectionState ?? "?"}`);
       if (peer.iceConnectionState === "failed" && !destroyed) {
+        if (currentSendFile && options.role === "guest") {
+          failActiveSend("ICE connection failed during send");
+        }
         if (options.role === "host" && (transferActive || wasConnected)) {
           options.onStatus("reconnecting");
           scheduleReconnect();
@@ -330,7 +492,6 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function setupDataChannel(channel: RTCDataChannel): void {
     channel.binaryType = "arraybuffer";
-    channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
     channel.onopen = () => {
       if (guestReadyTimer) {
@@ -349,6 +510,9 @@ export function createTransferSession(options: TransferSessionOptions) {
 
     channel.onclose = () => {
       debug("data channel closed");
+      if (currentSendFile) {
+        failActiveSend("Data channel closed during send");
+      }
       if (
         !destroyed &&
         options.role === "host" &&
@@ -372,30 +536,13 @@ export function createTransferSession(options: TransferSessionOptions) {
 
       try {
         const chunk = event.data as ArrayBuffer;
-        receiveBuffer.push(chunk);
+        if (receiveTarget) {
+          receiveTarget.set(new Uint8Array(chunk), receiveBytes);
+        } else {
+          receiveFallbackChunks.push(chunk);
+        }
         receiveBytes += chunk.byteLength;
-
-        const isDone = receiveBytes >= receiveMeta.size;
-        if (
-          isDone ||
-          receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL
-        ) {
-          lastProgressBytes = receiveBytes;
-          options.onProgress({
-            fileName: receiveMeta.name,
-            sent: receiveBytes,
-            total: receiveMeta.size,
-          });
-        }
-        if (
-          isDone ||
-          receiveBytes - lastDebugRecvBytes >= DEBUG_LOG_INTERVAL
-        ) {
-          debug(
-            `recv ${Math.round((receiveBytes / receiveMeta.size) * 100)}% (${(receiveBytes / (1024 * 1024)).toFixed(1)} MB)`
-          );
-          lastDebugRecvBytes = receiveBytes;
-        }
+        scheduleReceiveNotify();
       } catch {
         abortReceive(
           `Not enough memory to receive "${receiveMeta.name}". Try a smaller file or free up space on this device.`
@@ -410,16 +557,48 @@ export function createTransferSession(options: TransferSessionOptions) {
         resetReceiveState();
         receiveMeta = parsed;
         setTransferActive(true);
-        debug(
-          `recv meta: ${parsed.name} (${(parsed.size / 1024).toFixed(1)} KB)`
-        );
+        try {
+          receiveTarget = new Uint8Array(parsed.size);
+        } catch {
+          receiveTarget = null;
+          receiveFallbackChunks = [];
+          debug(
+            `recv meta: ${parsed.name} (${(parsed.size / 1024).toFixed(1)} KB) — streaming chunks (low memory)`
+          );
+        }
+        if (receiveTarget) {
+          debug(
+            `recv meta: ${parsed.name} (${(parsed.size / 1024).toFixed(1)} KB)`
+          );
+        }
         break;
 
       case "done":
+        clearReceiveNotify();
+        scheduleProgress(
+          receiveMeta?.name ?? "?",
+          receiveBytes,
+          receiveMeta?.size ?? receiveBytes
+        );
         debug(
           `recv done: ${receiveMeta?.name ?? "?"} — got ${receiveBytes} / ${receiveMeta?.size ?? "?"} bytes`
         );
         finalizeReceivedFile();
+        break;
+
+      case "partition":
+        if (dc?.readyState === "open") {
+          dc.send(
+            JSON.stringify({
+              type: "partition-received",
+              offset: parsed.offset,
+            } satisfies PartitionReceivedMessage)
+          );
+        }
+        break;
+
+      case "partition-received":
+        onPartitionReceived(parsed.offset);
         break;
     }
   }
@@ -540,6 +719,12 @@ export function createTransferSession(options: TransferSessionOptions) {
       await pc.setLocalDescription(offer);
       await waitForIceGathering(pc, ICE_GATHER_TIMEOUT_MS);
 
+      const detectedLan = extractPrivateHostIp(pc.localDescription?.sdp ?? "");
+      if (detectedLan) {
+        lanHost = lanHost ?? detectedLan;
+        debug(`LAN IP for ICE: ${detectedLan}`);
+      }
+
       const sent = await sendLocalDescription("offer");
       if (sent) {
         offerCreated = true;
@@ -594,11 +779,12 @@ export function createTransferSession(options: TransferSessionOptions) {
   }
 
   function resetReceiveState(): void {
-    receiveBuffer = [];
+    clearReceiveNotify();
+    receiveTarget = null;
+    receiveFallbackChunks = [];
     receiveMeta = null;
     receiveBytes = 0;
-    lastProgressBytes = 0;
-    lastDebugRecvBytes = 0;
+    lastLoggedRecvPct = -1;
   }
 
   function abortReceive(reason: string): void {
@@ -612,9 +798,16 @@ export function createTransferSession(options: TransferSessionOptions) {
     if (!receiveMeta) return;
 
     try {
-      const blob = new Blob(receiveBuffer, {
-        type: receiveMeta.mimeType || "application/octet-stream",
-      });
+      const blob = receiveTarget
+        ? new Blob(
+            [receiveTarget.subarray(0, receiveBytes) as Uint8Array<ArrayBuffer>],
+            {
+              type: receiveMeta.mimeType || "application/octet-stream",
+            }
+          )
+        : new Blob(receiveFallbackChunks, {
+            type: receiveMeta.mimeType || "application/octet-stream",
+          });
 
       options.onFileReceived({
         name: receiveMeta.name,
@@ -642,63 +835,81 @@ export function createTransferSession(options: TransferSessionOptions) {
       throw new Error("Data channel is not open");
     }
 
-    currentSendFile = file;
-    lastAckedOffset = startOffset;
-    sendBytesQueued = startOffset;
-    lastSendProgressBytes = startOffset;
-    setTransferActive(true);
+    return new Promise<void>((resolve, reject) => {
+      abortSend = reject;
 
-    const mbSize = (file.size / (1024 * 1024)).toFixed(1);
-    debug(
-      `send start: ${file.name} (${mbSize} MB)${startOffset ? ` from offset ${startOffset}` : ""}`
-    );
-    options.onProgress({ fileName: file.name, sent: startOffset, total: file.size });
+      currentSendFile = file;
+      lastAckedOffset = startOffset;
+      sendBytesQueued = startOffset;
+      lastLoggedSendPct = -1;
+      setTransferActive(true);
+      startSendHeartbeat(file);
 
-    if (startOffset === 0) {
-      const meta: FileMetaMessage = {
-        type: "meta",
-        name: file.name,
-        size: file.size,
-        mimeType: file.type || "application/octet-stream",
-      };
-      dc.send(JSON.stringify(meta));
-    }
+      const mbSize = (file.size / (1024 * 1024)).toFixed(1);
+      debug(
+        `send start: ${file.name} (${mbSize} MB, 64 KB chunks / 1 MB partitions)${startOffset ? ` from offset ${startOffset}` : ""}`
+      );
+      scheduleProgress(file.name, startOffset, file.size);
 
-    if (file.size === 0) {
-      dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
-      options.onFileSent?.({ name: file.name, size: file.size });
-      currentSendFile = null;
-      setTransferActive(false);
-      return;
-    }
-
-    let offset = startOffset;
-    let lastDebugSent = startOffset;
-
-    while (offset < file.size) {
-      if (!dc || dc.readyState !== "open") {
-        throw new Error("Data channel closed during send");
+      if (startOffset === 0) {
+        const meta: FileMetaMessage = {
+          type: "meta",
+          name: file.name,
+          size: file.size,
+          mimeType: file.type || "application/octet-stream",
+        };
+        dc!.send(JSON.stringify(meta));
       }
 
-      const end = Math.min(offset + CHUNK_SIZE, file.size);
-      const buffer = await file.slice(offset, end).arrayBuffer();
-      await sendBinaryChunk(file, buffer);
-      offset = end;
-      lastAckedOffset = offset;
-
-      if (offset - lastDebugSent >= DEBUG_LOG_INTERVAL || offset >= file.size) {
-        debug(
-          `send ${Math.round((offset / file.size) * 100)}% (${(offset / (1024 * 1024)).toFixed(1)} MB)`
-        );
-        lastDebugSent = offset;
+      if (file.size === 0) {
+        dc!.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
+        options.onFileSent?.({ name: file.name, size: file.size });
+        currentSendFile = null;
+        setTransferActive(false);
+        resolve();
+        return;
       }
-    }
 
-    dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
-    debug(`send done: ${file.name}`);
-    options.onFileSent?.({ name: file.name, size: file.size });
-    currentSendFile = null;
-    setTransferActive(false);
+      fileChunker = new FileChunker(
+        file,
+        startOffset,
+        (chunk) => {
+          sendRawChunk(file, chunk);
+          lastLoggedSendPct = logTransferProgress(
+            "send",
+            sendBytesQueued,
+            file.size,
+            lastLoggedSendPct
+          );
+        },
+        (offset) => onPartitionEnd(file, offset),
+        () => {
+          if (!dc || dc.readyState !== "open") {
+            reject(new Error("Data channel closed during send"));
+            return;
+          }
+          clearPartitionAckTimer();
+          dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
+          debug(`send done: ${file.name}`);
+          options.onFileSent?.({ name: file.name, size: file.size });
+          stopFileChunker();
+          currentSendFile = null;
+          setTransferActive(false);
+          resolve();
+        },
+        (error) => {
+          stopFileChunker();
+          currentSendFile = null;
+          setTransferActive(false);
+          reject(error);
+        }
+      );
+      fileChunker.nextPartition();
+    }).finally(() => {
+      abortSend = null;
+      stopSendHeartbeat();
+      stopFileChunker();
+    });
   }
 
   async function sendFile(file: File, startOffset = 0): Promise<void> {
@@ -770,7 +981,22 @@ export function createTransferSession(options: TransferSessionOptions) {
           `ICE path: ${local?.candidateType ?? "?"} ↔ ${remote?.candidateType ?? "?"}`
         );
         if (local?.candidateType === "relay" || remote?.candidateType === "relay") {
-          debug("⚠ TURN relay active — speeds will be limited");
+          debug("⚠ TURN relay — expect slower speeds");
+        } else if (
+          local?.candidateType !== "host" ||
+          remote?.candidateType !== "host"
+        ) {
+          debug(
+            "⚠ not a direct LAN path — if both devices are on the same Wi‑Fi, speeds may be much slower than expected"
+          );
+        }
+        if (pair.currentRoundTripTime) {
+          debug(`ICE RTT: ${Math.round(pair.currentRoundTripTime * 1000)} ms`);
+        }
+        if (pair.availableOutgoingBitrate) {
+          debug(
+            `ICE estimated uplink: ${(pair.availableOutgoingBitrate / (1024 * 1024)).toFixed(1)} Mbps`
+          );
         }
         logged = true;
       });
@@ -795,6 +1021,13 @@ export function createTransferSession(options: TransferSessionOptions) {
       ]);
       iceServers = servers;
       lanHost = config.lanHost ?? null;
+
+      const turnAvailable = hasTurnServer(iceServers);
+      debug(
+        turnAvailable
+          ? `ICE: ${iceServers.length} servers (STUN + TURN)`
+          : `ICE: STUN only — add Cloudflare TURN on Vercel for better cross-network speeds`
+      );
 
       if (destroyed) return;
 
@@ -846,6 +1079,15 @@ export function createTransferSession(options: TransferSessionOptions) {
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
+    }
+    if (progressFlushTimer) {
+      clearTimeout(progressFlushTimer);
+      progressFlushTimer = null;
+    }
+    stopSendHeartbeat();
+    stopFileChunker();
+    if (abortSend) {
+      failActiveSend("Transfer cancelled");
     }
 
     signaling?.destroy();
