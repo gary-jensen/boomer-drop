@@ -5,7 +5,7 @@ import {
 } from "./signaling-transport";
 import { fetchIceServers } from "./ice";
 import { FileChunker, CHUNK_SIZE, MAX_PARTITION_SIZE } from "./file-chunker";
-import { summarizeCandidates } from "./sdp";
+import { formatIceCandidate, summarizeCandidates } from "./sdp";
 
 export type ConnectionState =
   | "idle"
@@ -67,16 +67,19 @@ type ControlMessage =
   | PartitionMessage
   | PartitionReceivedMessage;
 
-function hasTurnServer(servers: RTCIceServer[]): boolean {
-  return servers.some((server) => {
-    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
-    return urls.some(
-      (url) => typeof url === "string" && url.startsWith("turn")
-    );
-  });
+function countRemoteSdpCandidates(sdp: string): { host: number; srflx: number } {
+  let host = 0;
+  let srflx = 0;
+  for (const line of sdp.split(/\r?\n/)) {
+    if (!line.startsWith("a=candidate:")) continue;
+    if (line.includes(" typ host ")) host++;
+    if (line.includes(" typ srflx ")) srflx++;
+  }
+  return { host, srflx };
 }
 
 const GUEST_READY_RETRY_MS = 1500;
+const ICE_GATHER_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 800;
 const PROGRESS_UI_INTERVAL_MS = 500;
 const LARGE_FILE_THRESHOLD = 10 * 1024 * 1024;
@@ -87,6 +90,30 @@ const IN_MEMORY_SEND_MAX = 256 * 1024 * 1024;
 /** Pause sending above this; resume only after draining to SEND_BUFFER_LOW. */
 const MAX_SEND_BUFFER = 2 * 1024 * 1024;
 const SEND_BUFFER_LOW = 512 * 1024;
+
+function waitForIceGathering(
+  peer: RTCPeerConnection,
+  timeoutMs: number
+): Promise<void> {
+  if (peer.iceGatheringState === "complete") {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const finish = () => {
+      peer.removeEventListener("icegatheringstatechange", onChange);
+      clearTimeout(timer);
+      resolve();
+    };
+
+    const onChange = () => {
+      if (peer.iceGatheringState === "complete") finish();
+    };
+
+    peer.addEventListener("icegatheringstatechange", onChange);
+    const timer = setTimeout(finish, timeoutMs);
+  });
+}
 
 export function createTransferSession(options: TransferSessionOptions) {
   let pc: RTCPeerConnection | null = null;
@@ -115,6 +142,8 @@ export function createTransferSession(options: TransferSessionOptions) {
   let lastProgressUiAt = 0;
   let pendingProgress: TransferProgress | null = null;
   let iceServers: RTCIceServer[] = [];
+  let remoteHostCandidates = 0;
+  let remoteSrflxCandidates = 0;
   let activeCandidatePair: {
     localType: string;
     remoteType: string;
@@ -540,6 +569,8 @@ export function createTransferSession(options: TransferSessionOptions) {
     makingOffer = false;
     remoteDescriptionSet = false;
     pendingIceCandidates.length = 0;
+    remoteHostCandidates = 0;
+    remoteSrflxCandidates = 0;
   }
 
   function closePeerConnection(): void {
@@ -571,7 +602,8 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function attachPeerHandlers(peer: RTCPeerConnection): void {
     peer.onicecandidate = (event) => {
-      if (!event.candidate) return;
+      if (!event.candidate?.candidate) return;
+      debug(`local ICE: ${formatIceCandidate(event.candidate.candidate)}`);
       void sendSignal({
         type: "ice",
         candidate: event.candidate.toJSON(),
@@ -751,6 +783,31 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
   }
 
+  async function addRemoteIceCandidate(
+    candidate: RTCIceCandidateInit
+  ): Promise<void> {
+    if (!pc) return;
+
+    const line = candidate.candidate ?? "";
+    if (line.includes(" typ host ")) remoteHostCandidates++;
+    if (line.includes(" typ srflx ")) remoteSrflxCandidates++;
+
+    if (line) {
+      debug(`remote ICE: ${formatIceCandidate(line)}`);
+    }
+
+    if (!remoteDescriptionSet) {
+      pendingIceCandidates.push(candidate);
+      return;
+    }
+
+    try {
+      await pc.addIceCandidate(candidate);
+    } catch {
+      // Ignore stale candidates.
+    }
+  }
+
   async function handleSignal(message: SignalMessage): Promise<void> {
     if (destroyed) return;
     if (!pc) {
@@ -776,12 +833,17 @@ export function createTransferSession(options: TransferSessionOptions) {
 
           options.onStatus("connecting");
           debug("got offer");
+          debug(`offer ${summarizeCandidates(message.sdp.sdp ?? "")}`);
           await pc.setRemoteDescription(message.sdp);
           remoteDescriptionSet = true;
+          const offerCounts = countRemoteSdpCandidates(message.sdp.sdp ?? "");
+          remoteHostCandidates += offerCounts.host;
+          remoteSrflxCandidates += offerCounts.srflx;
           await flushPendingIce();
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
+          await waitForIceGathering(pc, ICE_GATHER_TIMEOUT_MS);
           await sendLocalDescription("answer");
           debug("answer sent");
         }
@@ -790,23 +852,19 @@ export function createTransferSession(options: TransferSessionOptions) {
       case "answer":
         if (options.role === "host" && message.sdp) {
           debug("got answer");
+          debug(`answer ${summarizeCandidates(message.sdp.sdp ?? "")}`);
           await pc.setRemoteDescription(message.sdp);
           remoteDescriptionSet = true;
+          const answerCounts = countRemoteSdpCandidates(message.sdp.sdp ?? "");
+          remoteHostCandidates += answerCounts.host;
+          remoteSrflxCandidates += answerCounts.srflx;
           await flushPendingIce();
         }
         break;
 
       case "ice":
         if (message.candidate) {
-          if (!remoteDescriptionSet) {
-            pendingIceCandidates.push(message.candidate);
-            return;
-          }
-          try {
-            await pc.addIceCandidate(message.candidate);
-          } catch {
-            // Ignore stale candidates.
-          }
+          await addRemoteIceCandidate(message.candidate);
         }
         break;
     }
@@ -816,7 +874,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     const peer = new RTCPeerConnection({
       iceServers,
       bundlePolicy: "max-bundle",
-      iceCandidatePoolSize: 4,
+      iceCandidatePoolSize: 10,
     });
     attachPeerHandlers(peer);
 
@@ -854,6 +912,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
+      await waitForIceGathering(pc, ICE_GATHER_TIMEOUT_MS);
       const sent = await sendLocalDescription("offer");
       if (sent) {
         offerCreated = true;
@@ -1142,12 +1201,19 @@ export function createTransferSession(options: TransferSessionOptions) {
         remoteAddress: remote?.address ?? remote?.ip,
       };
 
-      if (localType === "relay" || remoteType === "relay") {
-        debug("⚠ TURN relay — expect slower speeds");
-      } else if (localType === "srflx" && remoteType === "srflx") {
-        debug("direct P2P via STUN (srflx ↔ srflx) — best non-LAN path");
+      if (localType === "srflx" && remoteType === "srflx") {
+        debug("direct P2P via STUN (srflx ↔ srflx)");
+      } else if (localType === "host" && remoteType === "host") {
+        debug("direct P2P (host ↔ host) — best path");
       } else if (localType !== "host" || remoteType !== "host") {
-        debug("⚠ asymmetric path — a better candidate pair may exist (see ICE pair list above)");
+        debug(
+          `⚠ asymmetric path (remote ICE seen: ${remoteHostCandidates} host, ${remoteSrflxCandidates} srflx)`
+        );
+        if (remoteHostCandidates > 0) {
+          debug("⚠ phone sent host candidates but ICE picked a different pair");
+        } else {
+          debug("⚠ no remote host candidates received — check signaling");
+        }
       }
     } catch {
       debug("could not read ICE stats");
@@ -1161,13 +1227,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     try {
       debug("loading ICE config");
       iceServers = await fetchIceServers();
-
-      const turnAvailable = hasTurnServer(iceServers);
-      debug(
-        turnAvailable
-          ? `ICE: ${iceServers.length} servers (STUN + TURN)`
-          : `ICE: STUN only — add Cloudflare TURN on Vercel for better cross-network speeds`
-      );
+      debug(`ICE: STUN only (${iceServers.length} server(s))`);
 
       if (destroyed) return;
 
