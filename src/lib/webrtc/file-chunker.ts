@@ -1,6 +1,6 @@
-/** Async chunk reader: 64 KB chunks, 1 MB partitions. */
-const CHUNK_SIZE = 64 * 1024;
-const MAX_PARTITION_SIZE = 1 * 1024 * 1024;
+/** Async chunk reader: 256 KB chunks, 1 MB partitions. */
+export const CHUNK_SIZE = 256 * 1024;
+export const MAX_PARTITION_SIZE = 1 * 1024 * 1024;
 
 export type ChunkHandler = (chunk: ArrayBuffer) => void | Promise<void>;
 

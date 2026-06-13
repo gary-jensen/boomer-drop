@@ -106,7 +106,7 @@ export function TransferPanel({
   useEffect(() => {
     if (!progress) {
       rateSampleRef.current = null;
-      setTransferRate(null);
+      queueMicrotask(() => setTransferRate(null));
       return;
     }
 
