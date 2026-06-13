@@ -75,6 +75,9 @@ const GUEST_READY_RETRY_MS = 1500;
 const ICE_GATHER_TIMEOUT_MS = 8000;
 const RECONNECT_DELAY_MS = 800;
 const PROGRESS_UPDATE_INTERVAL = 1 * 1024 * 1024;
+const MAX_BUFFERED_AMOUNT = 8 * 1024 * 1024;
+const BUFFERED_AMOUNT_LOW_THRESHOLD = 2 * 1024 * 1024;
+const PARTITION_ACK_TIMEOUT_MS = 60_000;
 
 function waitForIceGathering(
   peer: RTCPeerConnection,
@@ -131,6 +134,7 @@ export function createTransferSession(options: TransferSessionOptions) {
   let chunker: FileChunker | null = null;
   let lastAckedOffset = 0;
   let partitionAckWaiter: ((offset: number) => void) | null = null;
+  let pendingPartitionAckOffset: number | null = null;
 
   function debug(message: string): void {
     options.onDebug?.(message);
@@ -149,8 +153,19 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function waitForPartitionAck(expectedOffset: number): Promise<void> {
     return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Timed out waiting for receiver ack at ${expectedOffset} bytes`
+          )
+        );
+      }, PARTITION_ACK_TIMEOUT_MS);
+
       partitionAckWaiter = (offset) => {
-        if (offset === expectedOffset) resolve();
+        if (offset !== expectedOffset) return;
+        cleanup();
+        resolve();
       };
 
       const channel = dc;
@@ -159,11 +174,73 @@ export function createTransferSession(options: TransferSessionOptions) {
         reject(new Error("Data channel closed while waiting for partition ack"));
       };
       const cleanup = () => {
+        clearTimeout(timer);
         partitionAckWaiter = null;
         channel?.removeEventListener("close", onClose);
       };
       channel?.addEventListener("close", onClose);
     });
+  }
+
+  function waitForSendBuffer(channel: RTCDataChannel): Promise<void> {
+    if (channel.bufferedAmount <= MAX_BUFFERED_AMOUNT) {
+      return Promise.resolve();
+    }
+
+    channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
+
+    return new Promise((resolve, reject) => {
+      const cleanup = () => {
+        channel.removeEventListener("bufferedamountlow", onLow);
+        channel.removeEventListener("close", onClose);
+        channel.removeEventListener("error", onError);
+      };
+      const onLow = () => {
+        cleanup();
+        resolve();
+      };
+      const onClose = () => {
+        cleanup();
+        reject(new Error("Data channel closed while waiting to send"));
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("Data channel error while waiting to send"));
+      };
+      channel.addEventListener("bufferedamountlow", onLow);
+      channel.addEventListener("close", onClose);
+      channel.addEventListener("error", onError);
+    });
+  }
+
+  async function sendBinaryChunk(chunk: ArrayBuffer): Promise<void> {
+    if (!dc || dc.readyState !== "open") {
+      throw new Error("Data channel is not open");
+    }
+    await waitForSendBuffer(dc);
+    dc.send(chunk);
+  }
+
+  function trySendPartitionAck(offset: number): void {
+    if (!receiveMeta) return;
+    if (receiveBytes < offset) {
+      pendingPartitionAckOffset = offset;
+      return;
+    }
+    pendingPartitionAckOffset = null;
+    sendSignalOnChannel({
+      type: "partition-received",
+      offset,
+    });
+  }
+
+  function maybeFlushPendingPartitionAck(): void {
+    if (
+      pendingPartitionAckOffset !== null &&
+      receiveBytes >= pendingPartitionAckOffset
+    ) {
+      trySendPartitionAck(pendingPartitionAckOffset);
+    }
   }
 
   async function flushPendingIce(): Promise<void> {
@@ -270,6 +347,7 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function setupDataChannel(channel: RTCDataChannel): void {
     channel.binaryType = "arraybuffer";
+    channel.bufferedAmountLowThreshold = BUFFERED_AMOUNT_LOW_THRESHOLD;
 
     channel.onopen = () => {
       if (guestReadyTimer) {
@@ -313,6 +391,7 @@ export function createTransferSession(options: TransferSessionOptions) {
         const chunk = event.data as ArrayBuffer;
         receiveBuffer.push(chunk);
         receiveBytes += chunk.byteLength;
+        maybeFlushPendingPartitionAck();
 
         const isDone = receiveBytes >= receiveMeta.size;
         if (isDone || receiveBytes - lastProgressBytes >= PROGRESS_UPDATE_INTERVAL) {
@@ -343,12 +422,7 @@ export function createTransferSession(options: TransferSessionOptions) {
         break;
 
       case "partition":
-        if (receiveMeta && receiveBytes >= parsed.offset) {
-          sendSignalOnChannel({
-            type: "partition-received",
-            offset: parsed.offset,
-          });
-        }
+        trySendPartitionAck(parsed.offset);
         break;
 
       case "partition-received":
@@ -545,6 +619,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     receiveMeta = null;
     receiveBytes = 0;
     lastProgressBytes = 0;
+    pendingPartitionAckOffset = null;
   }
 
   function abortReceive(reason: string): void {
@@ -633,33 +708,32 @@ export function createTransferSession(options: TransferSessionOptions) {
         chunker = new FileChunker(
           file,
           offset,
-          (chunk) => {
-            if (!dc || dc.readyState !== "open") {
-              fail(new Error("Data channel closed during send"));
-              return;
-            }
-            dc.send(chunk);
+          async (chunk) => {
+            await sendBinaryChunk(chunk);
           },
-          (offset) => {
+          (partitionOffset) => {
             if (!dc || dc.readyState !== "open") {
               fail(new Error("Data channel closed during send"));
               return;
             }
 
             dc.send(
-              JSON.stringify({ type: "partition", offset } satisfies PartitionMessage)
+              JSON.stringify({
+                type: "partition",
+                offset: partitionOffset,
+              } satisfies PartitionMessage)
             );
 
-            void waitForPartitionAck(offset)
+            void waitForPartitionAck(partitionOffset)
               .then(() => {
-                lastAckedOffset = offset;
+                lastAckedOffset = partitionOffset;
                 options.onProgress({
                   fileName: file.name,
-                  sent: offset,
+                  sent: partitionOffset,
                   total: file.size,
                 });
                 if (chunker && !chunker.isFileEnd()) {
-                  startPartition(offset);
+                  startPartition(partitionOffset);
                 }
               })
               .catch(fail);
@@ -676,7 +750,8 @@ export function createTransferSession(options: TransferSessionOptions) {
             chunker = null;
             setTransferActive(false);
             finish();
-          }
+          },
+          (error) => fail(error)
         );
         chunker.nextPartition();
       };
