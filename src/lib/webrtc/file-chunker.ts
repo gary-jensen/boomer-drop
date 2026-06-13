@@ -13,7 +13,6 @@ export class FileChunker {
   private readonly _reader: FileReader;
   private _offset: number;
   private _partitionSize = 0;
-  private _busy = false;
 
   constructor(
     file: File,
@@ -41,7 +40,6 @@ export class FileChunker {
   }
 
   nextPartition(): void {
-    if (this._busy) return;
     this._partitionSize = 0;
     this._readChunk();
   }
@@ -60,7 +58,7 @@ export class FileChunker {
   }
 
   private _readChunk(): void {
-    if (this.isFileEnd() || this._busy) return;
+    if (this.isFileEnd()) return;
     const slice = this._file.slice(
       this._offset,
       this._offset + CHUNK_SIZE
@@ -69,7 +67,6 @@ export class FileChunker {
   }
 
   private async _onChunkRead(chunk: ArrayBuffer): Promise<void> {
-    this._busy = true;
     try {
       this._offset += chunk.byteLength;
       this._partitionSize += chunk.byteLength;
@@ -90,8 +87,6 @@ export class FileChunker {
       this._onError?.(
         error instanceof Error ? error : new Error(String(error))
       );
-    } finally {
-      this._busy = false;
     }
   }
 }
