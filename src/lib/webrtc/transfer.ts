@@ -130,11 +130,8 @@ export function createTransferSession(options: TransferSessionOptions) {
   let abortSend: ((error: Error) => void) | null = null;
   let recvNotifyTimer: ReturnType<typeof setTimeout> | null = null;
   let fileChunker: FileChunker | null = null;
-  let partitionAckTimer: ReturnType<typeof setTimeout> | null = null;
-  let pendingPartitionAck: (() => void) | null = null;
   let lastStatsBytesSent = 0;
   let lastStatsAt = 0;
-  let partitionSentAt = 0;
 
   function debug(message: string): void {
     options.onDebug?.(message);
@@ -158,16 +155,8 @@ export function createTransferSession(options: TransferSessionOptions) {
     abortSend?.(new Error(message));
   }
 
-  function clearPartitionAckTimer(): void {
-    if (!partitionAckTimer) return;
-    clearTimeout(partitionAckTimer);
-    partitionAckTimer = null;
-  }
-
   function stopFileChunker(): void {
     fileChunker = null;
-    clearPartitionAckTimer();
-    pendingPartitionAck = null;
   }
 
   function waitForSendBufferDrain(channel: RTCDataChannel): Promise<void> {
@@ -239,7 +228,6 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
 
     sendBytesQueued += byteLength;
-    lastAckedOffset = sendBytesQueued;
     lastSendActivityAt = Date.now();
     scheduleProgress(file.name, sendBytesQueued, file.size);
   }
@@ -250,52 +238,22 @@ export function createTransferSession(options: TransferSessionOptions) {
     });
   }
 
-  function waitForPartitionAck(offset: number): Promise<void> {
-    return new Promise((resolve, reject) => {
-      pendingPartitionAck = resolve;
-      clearPartitionAckTimer();
-      partitionAckTimer = setTimeout(() => {
-        pendingPartitionAck = null;
-        reject(
-          new Error(
-            `Timed out waiting for receiver at ${(offset / (1024 * 1024)).toFixed(1)} MB`
-          )
-        );
-      }, PARTITION_ACK_TIMEOUT_MS);
-    });
-  }
-
   function sendPartitionMessage(offset: number): void {
     if (!dc || dc.readyState !== "open") {
       failActiveSend("Data channel closed during send");
       return;
     }
-    partitionSentAt = Date.now();
     dc.send(JSON.stringify({ type: "partition", offset } satisfies PartitionMessage));
     debug(`send partition @ ${(offset / (1024 * 1024)).toFixed(1)} MB`);
   }
 
-  function onPartitionEnd(file: File, offset: number): void {
+  function onPartitionEnd(_file: File, offset: number): void {
     sendPartitionMessage(offset);
-    void waitForPartitionAck(offset).catch((error) => {
-      failActiveSend(error instanceof Error ? error.message : String(error));
-    });
   }
 
   function onPartitionReceived(offset: number): void {
-    clearPartitionAckTimer();
-    const ackMs = partitionSentAt > 0 ? Date.now() - partitionSentAt : 0;
-    debug(
-      `partition ack @ ${(offset / (1024 * 1024)).toFixed(1)} MB${ackMs > 0 ? ` (${ackMs} ms)` : ""}`
-    );
-
-    if (pendingPartitionAck) {
-      const resume = pendingPartitionAck;
-      pendingPartitionAck = null;
-      resume();
-      return;
-    }
-
+    lastAckedOffset = offset;
+    debug(`partition ack @ ${(offset / (1024 * 1024)).toFixed(1)} MB`);
     fileChunker?.nextPartition();
   }
 
@@ -317,7 +275,6 @@ export function createTransferSession(options: TransferSessionOptions) {
     }
 
     sendBytesQueued += byteLength;
-    lastAckedOffset = sendBytesQueued;
     lastSendActivityAt = Date.now();
     scheduleProgress(file.name, sendBytesQueued, file.size);
   }
@@ -329,32 +286,31 @@ export function createTransferSession(options: TransferSessionOptions) {
   ): Promise<void> {
     let offset = startOffset;
 
+    // Send the entire file continuously. Partition markers are resume checkpoints
+    // only — never block waiting for the receiver to ack them.
     while (offset < view.byteLength) {
-      const partitionEnd = Math.min(offset + MAX_PARTITION_SIZE, view.byteLength);
-      let chunkStart = offset;
-
-      while (chunkStart < partitionEnd) {
-        if (!dc || dc.readyState !== "open") {
-          throw new Error("Data channel is not open");
-        }
-        await waitForSendBufferDrain(dc);
-
-        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, partitionEnd);
-        sendChunkSync(file, view.subarray(chunkStart, chunkEnd));
-        lastLoggedSendPct = logTransferProgress(
-          "send",
-          sendBytesQueued,
-          file.size,
-          lastLoggedSendPct
-        );
-        chunkStart = chunkEnd;
+      if (!dc || dc.readyState !== "open") {
+        throw new Error("Data channel is not open");
       }
+      await waitForSendBufferDrain(dc);
 
-      offset = partitionEnd;
+      const chunkEnd = Math.min(offset + CHUNK_SIZE, view.byteLength);
+      sendChunkSync(file, view.subarray(offset, chunkEnd));
+      offset = chunkEnd;
 
-      if (offset < view.byteLength) {
+      lastLoggedSendPct = logTransferProgress(
+        "send",
+        sendBytesQueued,
+        file.size,
+        lastLoggedSendPct
+      );
+
+      if (
+        offset > 0 &&
+        offset % MAX_PARTITION_SIZE === 0 &&
+        offset < view.byteLength
+      ) {
         sendPartitionMessage(offset);
-        await waitForPartitionAck(offset);
       }
     }
   }
@@ -375,7 +331,6 @@ export function createTransferSession(options: TransferSessionOptions) {
     if (!dc || dc.readyState !== "open") {
       throw new Error("Data channel closed during send");
     }
-    clearPartitionAckTimer();
     dc.send(JSON.stringify({ type: "done" } satisfies FileDoneMessage));
     debug(`send done: ${file.name}`);
     options.onFileSent?.({ name: file.name, size: file.size });
@@ -1016,7 +971,7 @@ export function createTransferSession(options: TransferSessionOptions) {
       const mbSize = (file.size / (1024 * 1024)).toFixed(1);
       const useBuffer = file.size <= IN_MEMORY_SEND_MAX;
       debug(
-        `send start: ${file.name} (${mbSize} MB, ${CHUNK_SIZE / 1024} KB chunks / ${MAX_PARTITION_SIZE / (1024 * 1024)} MB partitions, ${useBuffer ? "buffered" : "streamed"})${startOffset ? ` from offset ${startOffset}` : ""}`
+        `send start: ${file.name} (${mbSize} MB, ${CHUNK_SIZE / 1024} KB chunks, pipelined${useBuffer ? " buffered" : ""})${startOffset ? ` from offset ${startOffset}` : ""}`
       );
       scheduleProgress(file.name, startOffset, file.size);
 

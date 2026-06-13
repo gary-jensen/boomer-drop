@@ -1,4 +1,4 @@
-/** Async chunk reader: 256 KB chunks, 8 MB partitions. */
+/** Async chunk reader: 256 KB chunks, 8 MB partition markers (resume checkpoints). */
 export const CHUNK_SIZE = 256 * 1024;
 export const MAX_PARTITION_SIZE = 8 * 1024 * 1024;
 
