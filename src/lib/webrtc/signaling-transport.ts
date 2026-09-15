@@ -1,156 +1,145 @@
 import type { SignalMessage, SignalRole } from "@/lib/signaling";
-import { isRealtimeConfigured } from "@/lib/supabase/client";
-import { RealtimeSignaling } from "./realtime-signaling";
-
-const POLL_INTERVAL_MS = 300;
-const REALTIME_CONNECT_TIMEOUT_MS = 10_000;
 
 export interface SignalingTransportOptions {
   roomId: string;
   role: SignalRole;
-  onMessage: (message: SignalMessage) => void;
+  onMessage: (message: SignalMessage) => void | Promise<void>;
   onDebug?: (message: string) => void;
 }
-
 export interface SignalingTransport {
   connect(): Promise<boolean>;
   send(message: SignalMessage): Promise<boolean>;
   destroy(): void;
-  mode: "realtime" | "poll";
+  mode: "websocket" | "poll";
 }
 
-class PollingSignaling implements SignalingTransport {
-  readonly mode = "poll" as const;
-  private readonly options: SignalingTransportOptions;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
-  private messageIndex = 0;
+class VpsSignaling implements SignalingTransport {
+  mode: "websocket" | "poll" = "websocket";
+  private socket: WebSocket | null = null;
+  private cursor = 0;
   private destroyed = false;
-
-  constructor(options: SignalingTransportOptions) {
-    this.options = options;
-  }
-
-  private debug(message: string): void {
-    this.options.onDebug?.(message);
-  }
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  private sequence = 0;
+  private incoming = Promise.resolve();
+  private pending = new Map<number, (ok: boolean) => void>();
+  private controller = new AbortController();
+  constructor(private readonly options: SignalingTransportOptions) {}
 
   async connect(): Promise<boolean> {
     if (this.destroyed) return false;
-    this.debug("signaling: HTTP poll");
-    this.startPolling();
+    const url = new URL("/ws", window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    url.searchParams.set("roomId", this.options.roomId);
+    url.searchParams.set("role", this.options.role);
+    url.searchParams.set("since", String(this.cursor));
+    const connected = await new Promise<boolean>((resolve) => {
+      const ws = new WebSocket(url);
+      this.socket = ws;
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        resolve(ok);
+      };
+      const timeout = setTimeout(() => { finish(false); ws.close(); }, 5000);
+      ws.onmessage = (event) => {
+        if (this.destroyed) return;
+        try {
+          const data = JSON.parse(event.data);
+          if (data.type === "ready") finish(true);
+          else if (data.type === "ack") this.pending.get(data.id)?.(true);
+          else if (data.type === "batch") {
+            this.incoming = this.incoming.then(() => this.deliver(data)).catch(() => {
+              this.options.onDebug?.("Could not handle signaling message");
+            });
+          }
+        } catch { this.options.onDebug?.("Invalid signaling response"); }
+      };
+      ws.onerror = () => finish(false);
+      ws.onclose = (event) => {
+        finish(false);
+        for (const done of this.pending.values()) done(false);
+        if (event.code === 4004) {
+          this.options.onDebug?.("Room expired — create a new room");
+          this.destroy();
+        } else if (!this.destroyed) this.startPolling();
+      };
+    });
+    if (this.destroyed) return false;
+    if (!connected) {
+      this.socket?.close();
+      this.startPolling();
+    } else this.options.onDebug?.("signaling: VPS WebSocket");
     return true;
+  }
+
+  private async deliver(data: { messages: SignalMessage[]; nextIndex: number }) {
+    if (this.destroyed || data.nextIndex <= this.cursor) return;
+    for (const message of data.messages) {
+      if (this.destroyed) return;
+      await this.options.onMessage(message);
+    }
+    this.cursor = data.nextIndex;
+  }
+
+  private startPolling() {
+    if (this.destroyed || this.mode === "poll") return;
+    this.mode = "poll";
+    this.options.onDebug?.("signaling: HTTP fallback");
+    // Wait for queued WebSocket batches before reading the same durable queue.
+    this.incoming = this.incoming.then(() => this.poll());
+  }
+  private async poll(): Promise<void> {
+    if (this.destroyed) return;
+    try {
+      const response = await fetch(`/api/signal/${this.options.roomId}?role=${this.options.role}&since=${this.cursor}`,
+        { cache: "no-store", signal: this.controller.signal });
+      if (response.status === 404) {
+        this.options.onDebug?.("Room expired — create a new room");
+        this.destroy();
+        return;
+      }
+      if (response.ok) await this.deliver(await response.json());
+    } catch { if (!this.destroyed) this.options.onDebug?.("Signaling reconnecting"); }
+    if (!this.destroyed) this.timer = setTimeout(() => { void this.poll(); }, 500);
   }
 
   async send(message: SignalMessage): Promise<boolean> {
     if (this.destroyed) return false;
+    if (this.mode === "websocket" && this.socket?.readyState === WebSocket.OPEN) {
+      const ws = this.socket;
+      const id = ++this.sequence;
+      return new Promise((resolve) => {
+        const timeout = setTimeout(() => { done(false); ws.close(); }, 5000);
+        const done = (ok: boolean) => {
+          clearTimeout(timeout);
+          this.pending.delete(id);
+          resolve(ok);
+        };
+        this.pending.set(id, done);
+        try { ws.send(JSON.stringify({ type: "send", id, message })); }
+        catch { done(false); ws.close(); }
+      });
+    }
     try {
       const response = await fetch(`/api/signal/${this.options.roomId}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ role: this.options.role, message }),
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role: this.options.role, message }), signal: this.controller.signal,
       });
-      if (!response.ok) {
-        this.debug(`signal POST failed (${response.status})`);
-      }
       return response.ok;
-    } catch {
-      this.debug("signal POST error");
-      return false;
-    }
+    } catch { return false; }
   }
-
-  private startPolling(): void {
-    if (this.pollTimer) return;
-    this.pollTimer = setInterval(() => {
-      void this.poll();
-    }, POLL_INTERVAL_MS);
-    void this.poll();
-  }
-
-  private async poll(): Promise<void> {
-    if (this.destroyed) return;
-    try {
-      const response = await fetch(
-        `/api/signal/${this.options.roomId}?role=${this.options.role}&since=${this.messageIndex}`
-      );
-      if (!response.ok) {
-        if (response.status === 404) {
-          this.debug("room expired — rescan QR on host");
-        }
-        return;
-      }
-
-      const data = (await response.json()) as {
-        messages: SignalMessage[];
-        nextIndex: number;
-      };
-
-      for (const message of data.messages) {
-        await this.options.onMessage(message);
-      }
-      this.messageIndex = data.nextIndex;
-    } catch {
-      this.debug("poll error");
-    }
-  }
-
   destroy(): void {
     this.destroyed = true;
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
-      this.pollTimer = null;
-    }
+    this.controller.abort();
+    if (this.timer) clearTimeout(this.timer);
+    for (const done of this.pending.values()) done(false);
+    this.socket?.close();
   }
 }
-
-class RealtimeSignalingTransport implements SignalingTransport {
-  readonly mode = "realtime" as const;
-  private readonly inner: RealtimeSignaling;
-
-  constructor(options: SignalingTransportOptions) {
-    this.inner = new RealtimeSignaling(options);
-  }
-
-  connect(): Promise<boolean> {
-    return this.inner.connect();
-  }
-
-  send(message: SignalMessage): Promise<boolean> {
-    return this.inner.send(message);
-  }
-
-  destroy(): void {
-    this.inner.destroy();
-  }
-}
-
-function withTimeout(promise: Promise<boolean>, ms: number): Promise<boolean> {
-  return Promise.race([
-    promise,
-    new Promise<boolean>((resolve) => {
-      setTimeout(() => resolve(false), ms);
-    }),
-  ]);
-}
-
-/** Prefer Supabase Realtime; fall back to HTTP polling if unavailable. */
-export async function createSignalingTransport(
-  options: SignalingTransportOptions
-): Promise<SignalingTransport> {
-  if (isRealtimeConfigured()) {
-    const realtime = new RealtimeSignalingTransport(options);
-    const ok = await withTimeout(realtime.connect(), REALTIME_CONNECT_TIMEOUT_MS);
-    if (ok) {
-      options.onDebug?.("signaling: Supabase Realtime");
-      return realtime;
-    }
-    realtime.destroy();
-    options.onDebug?.("signaling: Realtime failed — falling back to HTTP poll");
-  } else {
-    options.onDebug?.("signaling: Supabase not configured — using HTTP poll");
-  }
-
-  const polling = new PollingSignaling(options);
-  await polling.connect();
-  return polling;
+export async function createSignalingTransport(options: SignalingTransportOptions): Promise<SignalingTransport> {
+  const transport = new VpsSignaling(options);
+  await transport.connect();
+  return transport;
 }
