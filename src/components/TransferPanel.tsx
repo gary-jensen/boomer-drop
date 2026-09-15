@@ -22,8 +22,6 @@ import { FilePicker } from "./FilePicker";
 import { QRDisplay } from "./QRDisplay";
 import { VerificationBadge } from "./VerificationBadge";
 
-const SHOW_TRANSFER_LOG = true;
-
 function formatTransferRate(bytesPerSec: number): string {
   if (bytesPerSec >= 1024 * 1024) {
     return `${(bytesPerSec / (1024 * 1024)).toFixed(1)} MB/s`;
@@ -95,7 +93,6 @@ export function TransferPanel({
   const [sent, setSent] = useState<{ name: string; size: number }[]>([]);
   const [receiveError, setReceiveError] = useState<string | null>(null);
   const [sendError, setSendError] = useState<string | null>(null);
-  const [debugLog, setDebugLog] = useState<string[]>([]);
   const [autoDownload, setAutoDownload] = useState(() => getAutoDownloadEnabled());
   const sessionRef = useRef<ReturnType<typeof createTransferSession> | null>(
     null
@@ -122,11 +119,6 @@ export function TransferPanel({
       rateSampleRef.current = { at: now, sent: progress.sent };
     }
   }, [progress]);
-
-  const addDebug = useCallback((message: string) => {
-    const ts = new Date().toLocaleTimeString("en-US", { hour12: false });
-    setDebugLog((prev) => [...prev.slice(-19), `${ts}  ${message}`]);
-  }, []);
 
   const handleFileReceived = useCallback(
     (file: ReceivedFile) => {
@@ -170,9 +162,6 @@ export function TransferPanel({
       onTransferActive: (activeTransfer) => {
         if (active) setTransferActive(activeTransfer);
       },
-      onDebug: (message) => {
-        if (active) addDebug(message);
-      },
     });
 
     sessionRef.current = session;
@@ -183,7 +172,7 @@ export function TransferPanel({
       session.destroy();
       sessionRef.current = null;
     };
-  }, [roomId, role, sessionKey, addDebug, handleFileReceived]);
+  }, [roomId, role, sessionKey, handleFileReceived]);
 
   useEffect(() => {
     if (sending || transferActive || progress) {
@@ -217,25 +206,21 @@ export function TransferPanel({
     if (files[0]) {
       setProgress({ fileName: files[0].name, sent: 0, total: files[0].size });
     }
-    addDebug(`UI: sending ${files.length} file(s)`);
     try {
       await sessionRef.current.sendFiles(files);
-      addDebug("UI: send finished");
     } catch (error) {
       const message =
         error instanceof Error
           ? error.message
           : "Something went wrong while sending. Please try again.";
-      addDebug(`UI: send error — ${message}`);
       setSendError(message);
     } finally {
       setSending(false);
       setProgress(null);
     }
-  }, [status, addDebug]);
+  }, [status]);
 
   const handleRetry = useCallback(() => {
-    setDebugLog([]);
     setSent([]);
     setReceiveError(null);
     setSendError(null);
@@ -454,17 +439,6 @@ export function TransferPanel({
               </li>
             ))}
           </ul>
-        </section>
-      ) : null}
-
-      {(SHOW_TRANSFER_LOG || sending || transferActive) && debugLog.length > 0 ? (
-        <section className="panel overflow-hidden">
-          <p className="border-b border-line px-4 py-2 text-xs font-semibold uppercase tracking-wider text-ink-faint">
-            Transfer log
-          </p>
-          <pre className="max-h-48 overflow-y-auto px-4 py-3 font-mono text-[11px] leading-relaxed text-ink-soft">
-            {debugLog.join("\n")}
-          </pre>
         </section>
       ) : null}
 

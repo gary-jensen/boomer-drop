@@ -165,9 +165,6 @@ export function createTransferSession(options: TransferSessionOptions) {
 
   function debug(message: string): void {
     options.onDebug?.(message);
-    if (typeof console !== "undefined") {
-      console.log(`[BoomerDrop] ${message}`);
-    }
   }
 
   function setTransferActive(active: boolean): void {
@@ -439,6 +436,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     total: number,
     lastLoggedPct: number
   ): number {
+    if (!options.onDebug) return lastLoggedPct;
     const pct = Math.min(100, Math.floor((bytes / total) * 100));
     const step = total >= LARGE_FILE_THRESHOLD ? 5 : 1;
     if (pct < lastLoggedPct + step && bytes < total) return lastLoggedPct;
@@ -530,6 +528,7 @@ export function createTransferSession(options: TransferSessionOptions) {
   }
 
   function startSendHeartbeat(file: File): void {
+    if (!options.onDebug) return;
     stopSendHeartbeat();
     lastSendActivityAt = Date.now();
     lastStatsAt = Date.now();
@@ -1129,7 +1128,7 @@ export function createTransferSession(options: TransferSessionOptions) {
   }
 
   async function logCandidatePair(): Promise<void> {
-    if (!pc) return;
+    if (!options.onDebug || !pc) return;
     await new Promise((resolve) => setTimeout(resolve, 800));
     if (!pc) return;
 
