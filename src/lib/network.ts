@@ -31,6 +31,8 @@ function isUnreachableDevHost(hostname: string): boolean {
 
 /** Use LAN IP instead of localhost / 0.0.0.0 so phones can reach the dev server. */
 export function getJoinOrigin(request: Request): string {
+  const publicOrigin = process.env.BOOMER_DROP_PUBLIC_ORIGIN;
+  if (publicOrigin) return new URL(publicOrigin).origin;
   const url = new URL(request.url);
   const port = url.port || (url.protocol === "https:" ? "443" : "80");
 

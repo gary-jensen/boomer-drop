@@ -1227,7 +1227,7 @@ export function createTransferSession(options: TransferSessionOptions) {
     try {
       debug("loading ICE config");
       iceServers = await fetchIceServers();
-      debug(`ICE: STUN only (${iceServers.length} server(s))`);
+      debug(`ICE: ${iceServers.length} configured server(s)`);
 
       if (destroyed) return;
 
@@ -1240,9 +1240,7 @@ export function createTransferSession(options: TransferSessionOptions) {
       signaling = await createSignalingTransport({
         roomId: options.roomId,
         role: options.role,
-        onMessage: (message) => {
-          void handleSignal(message);
-        },
+        onMessage: handleSignal,
         onDebug: debug,
       });
 
